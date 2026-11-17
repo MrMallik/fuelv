@@ -121,6 +121,11 @@ class TestFuelVBackend(unittest.TestCase):
         by_week = self.repo.get_grouped_snapshots("week")
         self.assertEqual(len(by_week["groups"]), 3)
 
+        # Verify grouping by day
+        by_day = self.repo.get_grouped_snapshots("day")
+        self.assertEqual(len(by_day["groups"]), 3)
+        self.assertEqual(by_day["total_snapshots"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,19 +1,6 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
 import { RouterLink, RouterView } from 'vue-router'
 import ThemeToggle from './components/ThemeToggle.vue'
-import UiBadge from './components/ui/UiBadge.vue'
-import { fetchHealth, type HealthStatus } from './services/api'
-
-const health = ref<HealthStatus | null>(null)
-
-onMounted(async () => {
-  try {
-    health.value = await fetchHealth()
-  } catch {
-    health.value = null
-  }
-})
 </script>
 
 <template>
@@ -36,9 +23,6 @@ onMounted(async () => {
         </nav>
 
         <div class="nav-group">
-          <UiBadge v-if="health" variant="outline" :title="`Extractor: ${health.extractor_backend}`">
-            {{ health.extractor_model }}
-          </UiBadge>
           <ThemeToggle />
         </div>
       </div>
