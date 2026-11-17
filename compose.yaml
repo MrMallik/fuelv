@@ -1,0 +1,51 @@
+name: fuelv-production
+services:
+  fuelv:
+    container_name: fuelv
+    image: ${FUELV_IMAGE:-fuelv:${RELEASE:?RELEASE is required}}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_BASE_PATH: /fuelv/
+    environment:
+      EXTRACTOR_BACKEND: ${EXTRACTOR_BACKEND:-gemini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      CUSTOM_EXTRACTOR_URL: ${CUSTOM_EXTRACTOR_URL:-http://localhost:8080/predict}
+      CUSTOM_EXTRACTOR_MODEL_ID: ${CUSTOM_EXTRACTOR_MODEL_ID:-custom-fuel-ft-v1}
+      FUELV_DB_PATH: /app/data/fuelv.db
+      FUELV_IMAGES_DIR: /app/data/images
+    volumes:
+      - fuelv_data:/app/data
+    networks:
+      - default
+      - portfolio_net
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4); exit(0 if r.status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  fuelv_data:
+
+networks:
+  portfolio_net:
+    external: true
+    name: portfolio-production_default
