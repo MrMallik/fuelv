@@ -7,9 +7,11 @@ venv/
 .pytest_cache/
 
 # Runtime SQLite database & uploaded snapshot images
-data/fuelv.db
-data/fuelv.db-shm
-data/fuelv.db-wal
+*.db
+*.db-shm
+*.db-wal
+*.csv
+data/*.db*
 data/*.csv
 data/images/*
 !data/images/.gitkeep
@@ -21,4 +23,6 @@ data/images/*
 # Node / Frontend build
 frontend/node_modules/
 frontend/dist/
+web/
+.vite/
 .DS_Store

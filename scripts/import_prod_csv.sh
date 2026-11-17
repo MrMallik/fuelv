@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 CSV_FILE="${1:-data/my_bike_import.csv}"
-TARGET_HOST="${2:-cloud-endurance}"
+TARGET_HOST="${2:-${DEPLOY_HOST:-cloud-endurance}}"
 
 if [[ ! -f "$CSV_FILE" ]]; then
   echo "Error: CSV file not found at: $CSV_FILE" >&2
