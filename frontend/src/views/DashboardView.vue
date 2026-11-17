@@ -95,7 +95,11 @@ async function handleDelete(id: string) {
     await deleteSnapshot(id)
     await loadData()
   } catch (err: unknown) {
-    alert(err instanceof Error ? err.message : 'Delete failed')
+    if ((err as any)?.isAuthError) {
+      alert('Unauthorized: Configure your Admin Access Key (UUID) in the top navbar to delete entries.')
+    } else {
+      alert(err instanceof Error ? err.message : 'Delete failed')
+    }
   }
 }
 

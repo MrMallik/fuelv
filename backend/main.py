@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hmac
 import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +60,36 @@ class CreateSnapshotRequest(BaseModel):
     extra_data: dict[str, Any] = Field(default_factory=dict)
 
 
+def verify_write_access(
+    x_fuelv_key: str | None = Header(default=None, alias="X-FuelV-Key"),
+) -> None:
+    expected_key = os.getenv("FUELV_WRITE_KEY", "").strip()
+    if not expected_key:
+        return
+    if not x_fuelv_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: valid write access key (UUID) required.",
+        )
+    try:
+        parsed_key = str(uuid.UUID(x_fuelv_key.strip())).lower()
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: write access key must be a valid UUID.",
+        )
+    try:
+        expected_uuid = str(uuid.UUID(expected_key)).lower()
+    except (ValueError, AttributeError):
+        expected_uuid = expected_key.lower()
+
+    if not hmac.compare_digest(parsed_key, expected_uuid):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: invalid write access key.",
+        )
+
+
 def create_app(
     db_path: str | Path | None = None,
     images_dir: str | Path | None = None,
@@ -95,9 +126,10 @@ def create_app(
             "extractor_backend": backend,
             "extractor_model": extractor.model_id,
             "gemini_key_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "write_protection_enabled": bool(os.getenv("FUELV_WRITE_KEY", "").strip()),
         }
 
-    @app.post("/api/extract")
+    @app.post("/api/extract", dependencies=[Depends(verify_write_access)])
     async def extract_from_snapshots(
         odo_image: UploadFile | None = File(default=None),
         pump_image: UploadFile | None = File(default=None),
@@ -162,7 +194,7 @@ def create_app(
             },
         }
 
-    @app.post("/api/snapshots", status_code=201)
+    @app.post("/api/snapshots", status_code=201, dependencies=[Depends(verify_write_access)])
     def create_snapshot(payload: CreateSnapshotRequest) -> dict[str, Any]:
         record = app.state.repo.insert_snapshot(
             captured_at=payload.captured_at,
@@ -184,7 +216,7 @@ def create_app(
     ) -> dict[str, Any]:
         return app.state.repo.get_grouped_snapshots(group_by=by)
 
-    @app.delete("/api/snapshots/{snapshot_id}")
+    @app.delete("/api/snapshots/{snapshot_id}", dependencies=[Depends(verify_write_access)])
     def remove_snapshot(snapshot_id: str) -> dict[str, Any]:
         deleted = app.state.repo.delete_snapshot(snapshot_id)
         if not deleted:

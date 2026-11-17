@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import CameraModal from '../components/CameraModal.vue'
+import KeySettingsModal from '../components/KeySettingsModal.vue'
 import UiBadge from '../components/ui/UiBadge.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import UiInput from '../components/ui/UiInput.vue'
@@ -21,6 +22,7 @@ const pumpPreview = ref<string | null>(null)
 
 // Camera modal state ('odo' | 'pump' | null)
 const activeCameraTarget = ref<'odo' | 'pump' | null>(null)
+const showKeyModal = ref(false)
 
 // Extraction state
 const extracting = ref(false)
@@ -107,6 +109,9 @@ async function runExtraction() {
 
     step.value = 'confirm'
   } catch (err: unknown) {
+    if ((err as any)?.isAuthError) {
+      showKeyModal.value = true
+    }
     extractionWarning.value =
       err instanceof Error
         ? `${err.message}. Switched to manual fallback.`
@@ -167,6 +172,9 @@ async function submitSnapshot() {
 
     router.push('/')
   } catch (err: unknown) {
+    if ((err as any)?.isAuthError) {
+      showKeyModal.value = true
+    }
     saveError.value = err instanceof Error ? err.message : 'Failed to save snapshot'
   } finally {
     saving.value = false
@@ -473,6 +481,12 @@ async function submitSnapshot() {
       :filename-prefix="activeCameraTarget"
       @capture="onCameraCaptured"
       @close="activeCameraTarget = null"
+    />
+
+    <!-- Admin Access Key Modal -->
+    <KeySettingsModal
+      v-if="showKeyModal"
+      @close="showKeyModal = false"
     />
   </section>
 </template>

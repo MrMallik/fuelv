@@ -126,6 +126,40 @@ class TestFuelVBackend(unittest.TestCase):
         self.assertEqual(len(by_day["groups"]), 3)
         self.assertEqual(by_day["total_snapshots"], 3)
 
+    def test_verify_write_access_dependency(self) -> None:
+        try:
+            from backend.main import verify_write_access
+            from fastapi import HTTPException
+        except ImportError:
+            return
+
+        # 1. No key configured -> open access
+        with patch.dict("os.environ", {"FUELV_WRITE_KEY": ""}, clear=False):
+            verify_write_access(None)
+            verify_write_access("anything")
+
+        # 2. Key configured -> requires matching UUID
+        secret_uuid = "550e8400-e29b-41d4-a716-446655440000"
+        with patch.dict("os.environ", {"FUELV_WRITE_KEY": secret_uuid}, clear=False):
+            # Missing key raises 401
+            with self.assertRaises(HTTPException) as ctx:
+                verify_write_access(None)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # Invalid format raises 401
+            with self.assertRaises(HTTPException) as ctx:
+                verify_write_access("not-a-valid-uuid")
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # Different valid UUID raises 401
+            with self.assertRaises(HTTPException) as ctx:
+                verify_write_access("00000000-0000-0000-0000-000000000000")
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # Valid matching key passes (case-insensitive)
+            verify_write_access(secret_uuid)
+            verify_write_access(secret_uuid.upper())
+
 
 if __name__ == "__main__":
     unittest.main()

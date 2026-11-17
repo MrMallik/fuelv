@@ -16,6 +16,7 @@ services:
       CUSTOM_EXTRACTOR_MODEL_ID: ${CUSTOM_EXTRACTOR_MODEL_ID:-custom-fuel-ft-v1}
       FUELV_DB_PATH: /app/data/fuelv.db
       FUELV_IMAGES_DIR: /app/data/images
+      FUELV_WRITE_KEY: ${FUELV_WRITE_KEY:-}
     volumes:
       - fuelv_data:/app/data
     networks:
