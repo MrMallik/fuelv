@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-GroupByPeriod = Literal["week", "month", "year"]
+GroupByPeriod = Literal["day", "week", "month", "year"]
 
 PERIOD_FORMATS: dict[GroupByPeriod, str] = {
+    "day": "%Y-%m-%d",
     "week": "%Y-W%W",
     "month": "%Y-%m",
     "year": "%Y",

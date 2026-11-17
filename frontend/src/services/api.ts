@@ -1,4 +1,4 @@
-export type GroupByPeriod = 'week' | 'month' | 'year'
+export type GroupByPeriod = 'day' | 'week' | 'month' | 'year'
 
 export interface ExtractedFuelData {
   odometer_reading: number | null

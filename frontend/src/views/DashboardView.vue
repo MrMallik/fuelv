@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
+import ExpenseHeatmap from '../components/ExpenseHeatmap.vue'
 import UiBadge from '../components/ui/UiBadge.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import {
@@ -17,6 +18,11 @@ const data = ref<GroupedSnapshotsResponse | null>(null)
 const loading = ref(true)
 const error = ref<string | null>(null)
 const previewImage = ref<{ url: string; title: string } | null>(null)
+
+const allSnapshots = computed<FuelSnapshot[]>(() => {
+  if (!data.value) return []
+  return data.value.groups.flatMap((g) => g.snapshots)
+})
 
 async function loadData() {
   loading.value = true
@@ -41,6 +47,13 @@ onMounted(() => {
 function formatPeriodLabel(period: string, mode: GroupByPeriod): string {
   if (mode === 'year') return period
   if (mode === 'week') return period.replace('-W', ' · Week ')
+  if (mode === 'day') {
+    const dt = new Date(period + 'T12:00:00')
+    if (!isNaN(dt.getTime())) {
+      return dt.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
+    }
+    return period
+  }
   const [yr, mo] = period.split('-')
   if (yr && mo) {
     const dt = new Date(Number(yr), Number(mo) - 1, 1)
@@ -49,6 +62,13 @@ function formatPeriodLabel(period: string, mode: GroupByPeriod): string {
     }
   }
   return period
+}
+
+function onHeatmapSelectPeriod(periodKey: string) {
+  const el = document.getElementById(`period-${periodKey}`)
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 }
 
 function formatDateTime(iso: string): string {
@@ -123,11 +143,28 @@ function openImage(url: string | null, title: string) {
       </div>
     </div>
 
+    <!-- Expense Heatmap Component -->
+    <ExpenseHeatmap
+      v-if="data && data.total_snapshots > 0"
+      :mode="groupBy"
+      :snapshots="allSnapshots"
+      :groups="data.groups"
+      @select-period="onHeatmapSelectPeriod"
+    />
+
     <!-- Period Grouping Tabs -->
     <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 2.5rem">
       <h2 class="section-heading" style="margin: 0">Timeline</h2>
 
       <div class="ui-tabs-list" role="tablist" aria-label="Group snapshots by">
+        <button
+          type="button"
+          class="ui-tabs-trigger"
+          :class="{ active: groupBy === 'day' }"
+          @click="groupBy = 'day'"
+        >
+          Day
+        </button>
         <button
           type="button"
           class="ui-tabs-trigger"
@@ -174,7 +211,12 @@ function openImage(url: string | null, title: string) {
 
     <!-- Period Groups -->
     <div v-else>
-      <section v-for="group in data.groups" :key="group.period" class="period-block">
+      <section
+        v-for="group in data.groups"
+        :id="'period-' + group.period"
+        :key="group.period"
+        class="period-block"
+      >
         <header class="period-header-bar">
           <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem">
             <h3 class="period-heading">{{ formatPeriodLabel(group.period, groupBy) }}</h3>
