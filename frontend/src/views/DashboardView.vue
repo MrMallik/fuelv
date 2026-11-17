@@ -143,17 +143,8 @@ function openImage(url: string | null, title: string) {
       </div>
     </div>
 
-    <!-- Expense Heatmap Component -->
-    <ExpenseHeatmap
-      v-if="data && data.total_snapshots > 0"
-      :mode="groupBy"
-      :snapshots="allSnapshots"
-      :groups="data.groups"
-      @select-period="onHeatmapSelectPeriod"
-    />
-
-    <!-- Period Grouping Tabs -->
-    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 2.5rem">
+    <!-- Period Grouping Tabs (Timeline Options) -->
+    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem">
       <h2 class="section-heading" style="margin: 0">Timeline</h2>
 
       <div class="ui-tabs-list" role="tablist" aria-label="Group snapshots by">
@@ -191,6 +182,15 @@ function openImage(url: string | null, title: string) {
         </button>
       </div>
     </div>
+
+    <!-- Expense Heatmap Component (below Timeline Options) -->
+    <ExpenseHeatmap
+      v-if="data && data.total_snapshots > 0"
+      :mode="groupBy"
+      :snapshots="allSnapshots"
+      :groups="data.groups"
+      @select-period="onHeatmapSelectPeriod"
+    />
 
     <!-- Loading / Error / Empty States -->
     <p v-if="loading" style="padding: 3rem 0; font-size: 0.875rem; color: var(--muted-foreground)">
