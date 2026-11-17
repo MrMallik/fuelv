@@ -10,6 +10,7 @@ venv/
 data/fuelv.db
 data/fuelv.db-shm
 data/fuelv.db-wal
+data/*.csv
 data/images/*
 !data/images/.gitkeep
 
