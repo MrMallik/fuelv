@@ -72,6 +72,33 @@ export interface HealthStatus {
   extractor_backend: string
   extractor_model: string
   gemini_key_configured: boolean
+  write_protection_enabled?: boolean
+}
+
+const STORAGE_WRITE_KEY = 'fuelv_write_key'
+
+export function getStoredWriteKey(): string {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(STORAGE_WRITE_KEY) || ''
+}
+
+export function setStoredWriteKey(key: string): void {
+  if (typeof window === 'undefined') return
+  const trimmed = key.trim()
+  if (trimmed) {
+    window.localStorage.setItem(STORAGE_WRITE_KEY, trimmed)
+  } else {
+    window.localStorage.removeItem(STORAGE_WRITE_KEY)
+  }
+}
+
+function getWriteHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const key = getStoredWriteKey()
+  const headers: Record<string, string> = { ...extra }
+  if (key) {
+    headers['X-FuelV-Key'] = key
+  }
+  return headers
 }
 
 const API_BASE = (
@@ -102,28 +129,39 @@ export async function extractFromImages(
   if (odoFile) formData.append('odo_image', odoFile)
   if (pumpFile) formData.append('pump_image', pumpFile)
 
+  const headers = getWriteHeaders()
   const res = await fetch(`${API_BASE}/api/extract`, {
     method: 'POST',
+    headers,
     body: formData,
   })
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    throw new Error(errBody.detail || `Extraction failed (${res.status})`)
+    const err = new Error(errBody.detail || `Extraction failed (${res.status})`)
+    if (res.status === 401) {
+      ;(err as any).isAuthError = true
+    }
+    throw err
   }
   return res.json()
 }
 
 export async function createSnapshot(payload: CreateSnapshotPayload): Promise<FuelSnapshot> {
+  const headers = getWriteHeaders({ 'Content-Type': 'application/json' })
   const res = await fetch(`${API_BASE}/api/snapshots`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(payload),
   })
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    throw new Error(errBody.detail || `Failed to save snapshot (${res.status})`)
+    const err = new Error(errBody.detail || `Failed to save snapshot (${res.status})`)
+    if (res.status === 401) {
+      ;(err as any).isAuthError = true
+    }
+    throw err
   }
   return res.json()
 }
@@ -139,10 +177,17 @@ export async function fetchGroupedSnapshots(
 }
 
 export async function deleteSnapshot(id: string): Promise<void> {
+  const headers = getWriteHeaders()
   const res = await fetch(`${API_BASE}/api/snapshots/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+    headers,
   })
   if (!res.ok) {
-    throw new Error(`Failed to delete snapshot (${res.status})`)
+    const errBody = await res.json().catch(() => ({}))
+    const err = new Error(errBody.detail || `Failed to delete snapshot (${res.status})`)
+    if (res.status === 401) {
+      ;(err as any).isAuthError = true
+    }
+    throw err
   }
 }
