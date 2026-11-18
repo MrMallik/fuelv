@@ -263,6 +263,23 @@ class TestSecurityAndAccessControl(unittest.TestCase):
             self.assertEqual(verify_res.status_code, 200)
             self.assertEqual(verify_res.json()["latest"]["id"], snap["id"])
 
+    def test_slowapi_rate_limiting_enforcement(self) -> None:
+        """Verify that slowapi enforces rate limiting and returns 429 when limits are exceeded."""
+        test_app = create_app(db_path=self.db_path)
+        client = TestClient(test_app)
+
+        # /api/snapshots/latest is limited to 60/minute
+        hit_429 = False
+        for _ in range(65):
+            res = client.get("/api/snapshots/latest")
+            if res.status_code == 429:
+                hit_429 = True
+                self.assertIn("Rate limit exceeded", res.json()["detail"])
+                self.assertEqual(res.headers.get("Retry-After"), "60")
+                break
+
+        self.assertTrue(hit_429, "Rate limiter should have returned 429 after exceeding 60 requests/min")
+
 
 class TestDataIntegrityAndEdgeCases(unittest.TestCase):
     """Rigorous Data Integrity, Decimal Precision, and Edge Case Tests."""
