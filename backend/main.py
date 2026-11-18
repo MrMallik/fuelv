@@ -12,6 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .db.repository import GroupByPeriod, SnapshotRepository
 from .extraction import get_extractor, normalize_extracted_json
@@ -69,6 +74,29 @@ class UpdateSnapshotRequest(BaseModel):
     extra_data: dict[str, Any] | None = None
 
 
+def get_client_ip(request: Request) -> str:
+    """Extract client IP supporting Cloudflare (CF-Connecting-IP), reverse proxies (X-Forwarded-For),
+    and direct socket connections.
+    """
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+
+def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": f"Rate limit exceeded: {exc.detail}. Please slow down.",
+        },
+        headers={"Retry-After": "60"},
+    )
+
+
 def verify_write_access(
     x_fuelv_key: str | None = Header(default=None, alias="X-FuelV-Key"),
 ) -> None:
@@ -117,6 +145,16 @@ def create_app(
         allow_headers=["*"],
     )
 
+    rate_limit_enabled = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in ("true", "1", "yes")
+    limiter = Limiter(
+        key_func=get_client_ip,
+        enabled=rate_limit_enabled,
+        default_limits=["120/minute"],
+    )
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
     repo = SnapshotRepository(db_path=db_path)
     img_dir = Path(images_dir) if images_dir else get_images_dir()
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -127,7 +165,8 @@ def create_app(
     app.mount("/api/images", StaticFiles(directory=str(img_dir)), name="images")
 
     @app.get("/api/health")
-    def health_check() -> dict[str, Any]:
+    @limiter.exempt
+    def health_check(request: Request) -> dict[str, Any]:
         extractor = get_extractor()
         backend = os.getenv("EXTRACTOR_BACKEND", "gemini").strip().lower()
         return {
@@ -139,7 +178,9 @@ def create_app(
         }
 
     @app.post("/api/extract", dependencies=[Depends(verify_write_access)])
+    @limiter.limit("15/minute")
     async def extract_from_snapshots(
+        request: Request,
         odo_image: UploadFile | None = File(default=None),
         pump_image: UploadFile | None = File(default=None),
     ) -> dict[str, Any]:
@@ -231,12 +272,18 @@ def create_app(
         }
 
     @app.get("/api/snapshots/latest")
-    def get_latest_snapshot() -> dict[str, Any]:
+    @limiter.limit("60/minute")
+    def get_latest_snapshot(request: Request) -> dict[str, Any]:
         latest = app.state.repo.get_latest_snapshot()
         return {"latest": latest}
 
     @app.put("/api/snapshots/{snapshot_id}", dependencies=[Depends(verify_write_access)])
-    def edit_snapshot(snapshot_id: str, payload: UpdateSnapshotRequest) -> dict[str, Any]:
+    @limiter.limit("30/minute")
+    def edit_snapshot(
+        request: Request,
+        snapshot_id: str,
+        payload: UpdateSnapshotRequest,
+    ) -> dict[str, Any]:
         updated = app.state.repo.update_snapshot(
             snapshot_id,
             odometer_reading=payload.odometer_reading,
@@ -251,7 +298,11 @@ def create_app(
         return updated
 
     @app.post("/api/snapshots", status_code=201, dependencies=[Depends(verify_write_access)])
-    def create_snapshot(payload: CreateSnapshotRequest) -> dict[str, Any]:
+    @limiter.limit("30/minute")
+    def create_snapshot(
+        request: Request,
+        payload: CreateSnapshotRequest,
+    ) -> dict[str, Any]:
         record = app.state.repo.insert_snapshot(
             captured_at=payload.captured_at,
             odometer_reading=payload.odometer_reading,
@@ -267,13 +318,19 @@ def create_app(
         return record
 
     @app.get("/api/snapshots/grouped")
+    @limiter.limit("60/minute")
     def list_grouped_snapshots(
+        request: Request,
         by: GroupByPeriod = Query(default="month", description="Group snapshots by week, month, or year"),
     ) -> dict[str, Any]:
         return app.state.repo.get_grouped_snapshots(group_by=by)
 
     @app.delete("/api/snapshots/{snapshot_id}", dependencies=[Depends(verify_write_access)])
-    def remove_snapshot(snapshot_id: str) -> dict[str, Any]:
+    @limiter.limit("30/minute")
+    def remove_snapshot(
+        request: Request,
+        snapshot_id: str,
+    ) -> dict[str, Any]:
         deleted = app.state.repo.delete_snapshot(snapshot_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Snapshot not found")
