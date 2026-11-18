@@ -4,9 +4,10 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Generator, Literal
 
 GroupByPeriod = Literal["day", "week", "month", "year"]
 
@@ -35,10 +36,14 @@ class SnapshotRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
@@ -73,6 +78,77 @@ class SnapshotRepository:
         )
         return "vision" if matches_raw else "vision_edited"
 
+    def _recalculate_chronological_chain(self, conn: sqlite3.Connection) -> None:
+        """Recalculate previous_odometer, distance_delta, and km_per_l across all snapshots
+        in strict chronological order (captured_at ASC, created_at ASC).
+        """
+        rows = conn.execute(
+            """
+            SELECT id, odometer_reading, fuel_dispensed, extra_data
+            FROM fuel_snapshots
+            ORDER BY captured_at ASC, created_at ASC
+            """
+        ).fetchall()
+
+        prev_odo: float | None = None
+        for row in rows:
+            snap_id = row["id"]
+            odo = float(row["odometer_reading"])
+            fuel = float(row["fuel_dispensed"])
+            extra_raw = row["extra_data"]
+            extra = json.loads(extra_raw) if extra_raw else {}
+
+            changed = False
+            if prev_odo is not None:
+                if extra.get("previous_odometer") != prev_odo:
+                    extra["previous_odometer"] = prev_odo
+                    changed = True
+
+                if odo >= prev_odo:
+                    delta = round(odo - prev_odo, 1)
+                    if extra.get("distance_delta") != delta:
+                        extra["distance_delta"] = delta
+                        changed = True
+
+                    if fuel > 0 and delta > 0:
+                        kmpl = round(delta / fuel, 2)
+                        if extra.get("km_per_l") != kmpl:
+                            extra["km_per_l"] = kmpl
+                            changed = True
+                    elif fuel > 0:
+                        if extra.get("km_per_l") != 0.0:
+                            extra["km_per_l"] = 0.0
+                            changed = True
+                    else:
+                        if "km_per_l" in extra:
+                            extra.pop("km_per_l", None)
+                            changed = True
+                else:
+                    if "distance_delta" in extra:
+                        extra.pop("distance_delta", None)
+                        changed = True
+                    if "km_per_l" in extra:
+                        extra.pop("km_per_l", None)
+                        changed = True
+            else:
+                if "previous_odometer" in extra:
+                    extra.pop("previous_odometer", None)
+                    changed = True
+                if "distance_delta" in extra:
+                    extra.pop("distance_delta", None)
+                    changed = True
+                if "km_per_l" in extra:
+                    extra.pop("km_per_l", None)
+                    changed = True
+
+            if changed:
+                conn.execute(
+                    "UPDATE fuel_snapshots SET extra_data = ? WHERE id = ?",
+                    (json.dumps(extra), snap_id),
+                )
+
+            prev_odo = odo
+
     def insert_snapshot(
         self,
         *,
@@ -103,29 +179,6 @@ class SnapshotRepository:
         extra_dict = dict(extra_data or {})
 
         with self._connect() as conn:
-            # Check preceding snapshot chronologically to compute distance delta and km/L
-            if "km_per_l" not in extra_dict:
-                prev_row = conn.execute(
-                    """
-                    SELECT odometer_reading FROM fuel_snapshots
-                    WHERE captured_at <= ?
-                    ORDER BY captured_at DESC, created_at DESC
-                    LIMIT 1
-                    """,
-                    (timestamp,),
-                ).fetchone()
-
-                if prev_row:
-                    prev_odo = float(prev_row["odometer_reading"])
-                    if float(odometer_reading) >= prev_odo:
-                        delta = round(float(odometer_reading) - prev_odo, 1)
-                        extra_dict["previous_odometer"] = prev_odo
-                        extra_dict["distance_delta"] = delta
-                        if float(fuel_dispensed) > 0 and delta > 0:
-                            extra_dict["km_per_l"] = round(delta / float(fuel_dispensed), 2)
-                        elif float(fuel_dispensed) > 0:
-                            extra_dict["km_per_l"] = 0.0
-
             extra_json_str = json.dumps(extra_dict)
 
             conn.execute(
@@ -160,6 +213,7 @@ class SnapshotRepository:
                     extra_json_str,
                 ),
             )
+            self._recalculate_chronological_chain(conn)
             conn.commit()
 
         return self.get_snapshot(snapshot_id)  # type: ignore[return-value]
@@ -221,28 +275,6 @@ class SnapshotRepository:
             resolved_mode = "vision_edited"
 
         with self._connect() as conn:
-            # Recompute distance delta and km/L based on preceding log
-            prev_row = conn.execute(
-                """
-                SELECT odometer_reading FROM fuel_snapshots
-                WHERE captured_at <= ? AND id != ?
-                ORDER BY captured_at DESC, created_at DESC
-                LIMIT 1
-                """,
-                (new_captured_at, snapshot_id),
-            ).fetchone()
-
-            if prev_row:
-                prev_odo = float(prev_row["odometer_reading"])
-                if new_odo >= prev_odo:
-                    delta = round(new_odo - prev_odo, 1)
-                    current_extra["previous_odometer"] = prev_odo
-                    current_extra["distance_delta"] = delta
-                    if new_fuel > 0 and delta > 0:
-                        current_extra["km_per_l"] = round(delta / new_fuel, 2)
-                    elif new_fuel > 0:
-                        current_extra["km_per_l"] = 0.0
-
             conn.execute(
                 """
                 UPDATE fuel_snapshots
@@ -265,6 +297,7 @@ class SnapshotRepository:
                     snapshot_id,
                 ),
             )
+            self._recalculate_chronological_chain(conn)
             conn.commit()
 
         return self.get_snapshot(snapshot_id)
@@ -272,6 +305,8 @@ class SnapshotRepository:
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM fuel_snapshots WHERE id = ?", (snapshot_id,))
+            if cursor.rowcount > 0:
+                self._recalculate_chronological_chain(conn)
             conn.commit()
             return cursor.rowcount > 0
 
