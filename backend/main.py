@@ -159,10 +159,13 @@ def create_app(
         pump_mime: str | None = None
         pump_rel_path: str | None = None
 
+        ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"}
+
         if odo_image is not None:
             odo_bytes = await odo_image.read()
             odo_mime = odo_image.content_type or "image/jpeg"
-            ext = Path(odo_image.filename or "odo.jpg").suffix or ".jpg"
+            raw_ext = Path(odo_image.filename or "odo.jpg").suffix.lower()
+            ext = raw_ext if raw_ext in ALLOWED_IMAGE_EXTENSIONS else ".jpg"
             odo_filename = f"{batch_prefix}_odo{ext}"
             (app.state.images_dir / odo_filename).write_bytes(odo_bytes)
             odo_rel_path = f"images/{odo_filename}"
@@ -170,7 +173,8 @@ def create_app(
         if pump_image is not None:
             pump_bytes = await pump_image.read()
             pump_mime = pump_image.content_type or "image/jpeg"
-            ext = Path(pump_image.filename or "pump.jpg").suffix or ".jpg"
+            raw_ext = Path(pump_image.filename or "pump.jpg").suffix.lower()
+            ext = raw_ext if raw_ext in ALLOWED_IMAGE_EXTENSIONS else ".jpg"
             pump_filename = f"{batch_prefix}_pump{ext}"
             (app.state.images_dir / pump_filename).write_bytes(pump_bytes)
             pump_rel_path = f"images/{pump_filename}"
@@ -285,9 +289,12 @@ def create_app(
 
         @app.get("/{full_path:path}", include_in_schema=False)
         def serve_spa(full_path: str) -> FileResponse:
-            candidate = (web_dist / full_path).resolve()
-            if full_path and candidate.is_file() and str(candidate).startswith(str(web_dist.resolve())):
-                return FileResponse(candidate)
+            try:
+                candidate = (web_dist / full_path).resolve()
+                if full_path and candidate.is_file() and candidate.is_relative_to(web_dist.resolve()):
+                    return FileResponse(candidate)
+            except (ValueError, RuntimeError):
+                pass
             return FileResponse(index_html)
 
     return app
