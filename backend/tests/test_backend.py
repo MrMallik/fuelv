@@ -100,10 +100,33 @@ class TestFuelVBackend(unittest.TestCase):
         )
         self.assertEqual(s3["entry_mode"], "vision_edited")
 
+        # Verify automatic km/L and distance delta calculation
+        # s2 odometer was 12250.0; s3 odometer is 12510.5 -> delta = 260.5 km; fuel = 5.38 L -> 260.5 / 5.38 = 48.42 km/L
+        self.assertEqual(s3["extra_data"]["previous_odometer"], 12250.0)
+        self.assertEqual(s3["extra_data"]["distance_delta"], 260.5)
+        self.assertEqual(s3["extra_data"]["km_per_l"], 48.42)
+
+        # Verify get_latest_snapshot
+        latest = self.repo.get_latest_snapshot()
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["id"], s3["id"])
+        self.assertEqual(latest["odometer_reading"], 12510.5)
+
+        # Verify update_snapshot: edit odometer to 12520.0 (delta = 270.0, 270.0 / 5.38 = 50.19 km/L)
+        updated_s3 = self.repo.update_snapshot(
+            s3["id"],
+            odometer_reading=12520.0,
+        )
+        self.assertIsNotNone(updated_s3)
+        self.assertEqual(updated_s3["odometer_reading"], 12520.0)
+        self.assertEqual(updated_s3["extra_data"]["distance_delta"], 270.0)
+        self.assertEqual(updated_s3["extra_data"]["km_per_l"], 50.19)
+
         # Verify grouping by month
         by_month = self.repo.get_grouped_snapshots("month")
         self.assertEqual(by_month["total_snapshots"], 3)
         self.assertEqual(by_month["overall_expense"], 1650.0)
+        self.assertEqual(by_month["overall_distance"], 520.0)
         self.assertEqual(len(by_month["groups"]), 2)
         self.assertEqual(by_month["groups"][0]["period"], "2026-11")
         self.assertEqual(by_month["groups"][0]["snapshot_count"], 2)
