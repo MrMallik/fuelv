@@ -1,4 +1,4 @@
-# FuelV — Snapshot Fuel Log
+# FuelV — The Visual Fuel Logger
 
 A lightweight, extensible fullstack fuel logging web app built with a **Vue 3 (Vite + Vue Router)** frontend (`frontend/`) and a **Python FastAPI + SQLite3** backend (`backend/`), styled to match `portfolio-website`.
 

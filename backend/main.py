@@ -60,6 +60,15 @@ class CreateSnapshotRequest(BaseModel):
     extra_data: dict[str, Any] = Field(default_factory=dict)
 
 
+class UpdateSnapshotRequest(BaseModel):
+    captured_at: str | None = None
+    odometer_reading: float | None = Field(default=None, ge=0)
+    total_expense: float | None = Field(default=None, ge=0)
+    fuel_dispensed: float | None = Field(default=None, ge=0)
+    entry_mode: str | None = None
+    extra_data: dict[str, Any] | None = None
+
+
 def verify_write_access(
     x_fuelv_key: str | None = Header(default=None, alias="X-FuelV-Key"),
 ) -> None:
@@ -95,8 +104,8 @@ def create_app(
     images_dir: str | Path | None = None,
 ) -> FastAPI:
     app = FastAPI(
-        title="FuelV API",
-        description="Snapshot-based fuel log backend with swappable vision extraction and SQLite3 storage.",
+        title="FuelV — The Visual Fuel Logger API",
+        description="Snapshot-based visual fuel log backend with swappable vision extraction and SQLite3 storage.",
         version="0.1.0",
     )
 
@@ -182,8 +191,31 @@ def create_app(
             extracted_json = normalize_extracted_json(None)
             warning_msg = str(exc)
 
+        latest = app.state.repo.get_latest_snapshot()
+        efficiency_info: dict[str, Any] | None = None
+        if latest and latest.get("odometer_reading") is not None:
+            prev_odo = float(latest["odometer_reading"])
+            extracted_odo = extracted_json.get("odometer_reading")
+            extracted_fuel = extracted_json.get("fuel_dispensed")
+
+            dist_delta = None
+            kmpl = None
+            if extracted_odo is not None and float(extracted_odo) >= prev_odo:
+                dist_delta = round(float(extracted_odo) - prev_odo, 1)
+                if extracted_fuel is not None and float(extracted_fuel) > 0 and dist_delta > 0:
+                    kmpl = round(dist_delta / float(extracted_fuel), 2)
+                elif extracted_fuel is not None and float(extracted_fuel) > 0:
+                    kmpl = 0.0
+
+            efficiency_info = {
+                "previous_odometer": prev_odo,
+                "distance_delta": dist_delta,
+                "km_per_l": kmpl,
+            }
+
         return {
             "extraction": extracted_json,
+            "efficiency": efficiency_info,
             "meta": {
                 "extractor_model": extractor.model_id,
                 "odo_image_path": odo_rel_path,
@@ -193,6 +225,26 @@ def create_app(
                 "warning": warning_msg,
             },
         }
+
+    @app.get("/api/snapshots/latest")
+    def get_latest_snapshot() -> dict[str, Any]:
+        latest = app.state.repo.get_latest_snapshot()
+        return {"latest": latest}
+
+    @app.put("/api/snapshots/{snapshot_id}", dependencies=[Depends(verify_write_access)])
+    def edit_snapshot(snapshot_id: str, payload: UpdateSnapshotRequest) -> dict[str, Any]:
+        updated = app.state.repo.update_snapshot(
+            snapshot_id,
+            odometer_reading=payload.odometer_reading,
+            total_expense=payload.total_expense,
+            fuel_dispensed=payload.fuel_dispensed,
+            captured_at=payload.captured_at,
+            entry_mode=payload.entry_mode,
+            extra_data=payload.extra_data,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return updated
 
     @app.post("/api/snapshots", status_code=201, dependencies=[Depends(verify_write_access)])
     def create_snapshot(payload: CreateSnapshotRequest) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import { RouterLink, RouterView } from 'vue-router'
 import KeySettingsModal from './components/KeySettingsModal.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import UiButton from './components/ui/UiButton.vue'
+import logoUrl from './assets/logo/fuelv-logo-128.png'
 
 const showKeyModal = ref(false)
 </script>
@@ -12,21 +13,16 @@ const showKeyModal = ref(false)
   <div class="app-shell">
     <header class="site-header">
       <div class="site-header-inner">
+        <!-- App Brand on the left -->
         <div class="brand-group">
-          <a href="/" class="brand-link text-link" title="Back to Portfolio">Portfolio</a>
-          <span class="brand-sep">/</span>
-          <RouterLink to="/" class="brand-link">FuelV</RouterLink>
+          <RouterLink to="/" class="brand-link" title="FuelV — The Visual Fuel Logger">
+            <img :src="logoUrl" alt="FuelV Logo" class="brand-logo-img" />
+            <span class="brand-name">FuelV</span>
+            <span class="brand-tagline">The Visual Fuel Logger</span>
+          </RouterLink>
         </div>
 
-        <nav aria-label="FuelV navigation" class="nav-group">
-          <RouterLink to="/" class="nav-item" exact-active-class="active">
-            Snapshots
-          </RouterLink>
-          <RouterLink to="/capture" class="nav-item" active-class="active">
-            Capture
-          </RouterLink>
-        </nav>
-
+        <!-- Navigation and Actions on the right -->
         <div class="nav-group">
           <UiButton
             variant="ghost"
@@ -46,17 +42,6 @@ const showKeyModal = ref(false)
     <main class="page-container">
       <RouterView />
     </main>
-
-    <footer class="site-footer">
-      <div class="site-footer-inner">
-        <p>© {{ new Date().getFullYear() }} FuelV · Snapshot Fuel Log</p>
-        <nav aria-label="Footer navigation" class="nav-group" style="gap: 1.25rem">
-          <a href="/" class="text-link">Portfolio</a>
-          <RouterLink to="/" class="text-link">Logs</RouterLink>
-          <RouterLink to="/capture" class="text-link">New Snapshot</RouterLink>
-        </nav>
-      </div>
-    </footer>
 
     <!-- Access Key Modal -->
     <KeySettingsModal v-if="showKeyModal" @close="showKeyModal = false" />

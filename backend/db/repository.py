@@ -100,9 +100,34 @@ class SnapshotRepository:
         )
 
         raw_json_str = json.dumps(raw_extraction_json) if raw_extraction_json is not None else None
-        extra_json_str = json.dumps(extra_data or {})
+        extra_dict = dict(extra_data or {})
 
         with self._connect() as conn:
+            # Check preceding snapshot chronologically to compute distance delta and km/L
+            if "km_per_l" not in extra_dict:
+                prev_row = conn.execute(
+                    """
+                    SELECT odometer_reading FROM fuel_snapshots
+                    WHERE captured_at <= ?
+                    ORDER BY captured_at DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (timestamp,),
+                ).fetchone()
+
+                if prev_row:
+                    prev_odo = float(prev_row["odometer_reading"])
+                    if float(odometer_reading) >= prev_odo:
+                        delta = round(float(odometer_reading) - prev_odo, 1)
+                        extra_dict["previous_odometer"] = prev_odo
+                        extra_dict["distance_delta"] = delta
+                        if float(fuel_dispensed) > 0 and delta > 0:
+                            extra_dict["km_per_l"] = round(delta / float(fuel_dispensed), 2)
+                        elif float(fuel_dispensed) > 0:
+                            extra_dict["km_per_l"] = 0.0
+
+            extra_json_str = json.dumps(extra_dict)
+
             conn.execute(
                 """
                 INSERT INTO fuel_snapshots (
@@ -148,6 +173,101 @@ class SnapshotRepository:
         if not row:
             return None
         return self._row_to_dict(row)
+
+    def get_latest_snapshot(self) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM fuel_snapshots
+                ORDER BY captured_at DESC, created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_dict(row)
+
+    def update_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        odometer_reading: float | None = None,
+        total_expense: float | None = None,
+        fuel_dispensed: float | None = None,
+        captured_at: str | None = None,
+        entry_mode: str | None = None,
+        extra_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        current = self.get_snapshot(snapshot_id)
+        if not current:
+            return None
+
+        new_odo = float(odometer_reading) if odometer_reading is not None else float(current["odometer_reading"])
+        new_exp = float(total_expense) if total_expense is not None else float(current["total_expense"])
+        new_fuel = float(fuel_dispensed) if fuel_dispensed is not None else float(current["fuel_dispensed"])
+        new_captured_at = captured_at if captured_at is not None else current["captured_at"]
+
+        current_extra = dict(current.get("extra_data") or {})
+        if extra_data:
+            current_extra.update(extra_data)
+
+        # Detect entry_mode update
+        resolved_mode = entry_mode or current["entry_mode"]
+        if resolved_mode == "vision" and (
+            abs(new_odo - float(current["odometer_reading"])) > 1e-4
+            or abs(new_exp - float(current["total_expense"])) > 1e-4
+            or abs(new_fuel - float(current["fuel_dispensed"])) > 1e-4
+        ):
+            resolved_mode = "vision_edited"
+
+        with self._connect() as conn:
+            # Recompute distance delta and km/L based on preceding log
+            prev_row = conn.execute(
+                """
+                SELECT odometer_reading FROM fuel_snapshots
+                WHERE captured_at <= ? AND id != ?
+                ORDER BY captured_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (new_captured_at, snapshot_id),
+            ).fetchone()
+
+            if prev_row:
+                prev_odo = float(prev_row["odometer_reading"])
+                if new_odo >= prev_odo:
+                    delta = round(new_odo - prev_odo, 1)
+                    current_extra["previous_odometer"] = prev_odo
+                    current_extra["distance_delta"] = delta
+                    if new_fuel > 0 and delta > 0:
+                        current_extra["km_per_l"] = round(delta / new_fuel, 2)
+                    elif new_fuel > 0:
+                        current_extra["km_per_l"] = 0.0
+
+            conn.execute(
+                """
+                UPDATE fuel_snapshots
+                SET
+                    odometer_reading = ?,
+                    total_expense = ?,
+                    fuel_dispensed = ?,
+                    captured_at = ?,
+                    entry_mode = ?,
+                    extra_data = ?
+                WHERE id = ?
+                """,
+                (
+                    new_odo,
+                    new_exp,
+                    new_fuel,
+                    new_captured_at,
+                    resolved_mode,
+                    json.dumps(current_extra),
+                    snapshot_id,
+                ),
+            )
+            conn.commit()
+
+        return self.get_snapshot(snapshot_id)
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._connect() as conn:
@@ -206,11 +326,17 @@ class SnapshotRepository:
 
         groups_list = sorted(groups_map.values(), key=lambda g: g["period"], reverse=True)
 
+        overall_min_odo = min((r["odometer_reading"] for r in rows), default=0.0)
+        overall_max_odo = max((r["odometer_reading"] for r in rows), default=0.0)
+        overall_distance = round(max(0.0, overall_max_odo - overall_min_odo), 1) if len(rows) > 1 else 0.0
+
         return {
             "group_by": group_by,
             "total_snapshots": len(rows),
+            "total_logs": len(rows),
             "overall_expense": overall_expense,
             "overall_fuel_dispensed": overall_fuel,
+            "overall_distance": overall_distance,
             "groups": groups_list,
         }
 

@@ -6,8 +6,15 @@ export interface ExtractedFuelData {
   fuel_dispensed: number | null
 }
 
+export interface ExtractionEfficiency {
+  previous_odometer: number | null
+  distance_delta: number | null
+  km_per_l: number | null
+}
+
 export interface ExtractionResponse {
   extraction: ExtractedFuelData
+  efficiency?: ExtractionEfficiency | null
   meta: {
     extractor_model: string
     odo_image_path: string | null
@@ -49,10 +56,14 @@ export interface SnapshotPeriodGroup {
 export interface GroupedSnapshotsResponse {
   group_by: GroupByPeriod
   total_snapshots: number
+  total_logs?: number
   overall_expense: number
   overall_fuel_dispensed: number
+  overall_distance?: number
   groups: SnapshotPeriodGroup[]
 }
+
+export type FuelLog = FuelSnapshot
 
 export interface CreateSnapshotPayload {
   captured_at?: string
@@ -190,4 +201,42 @@ export async function deleteSnapshot(id: string): Promise<void> {
     }
     throw err
   }
+}
+
+export interface UpdateSnapshotPayload {
+  captured_at?: string
+  odometer_reading?: number
+  total_expense?: number
+  fuel_dispensed?: number
+  entry_mode?: 'vision' | 'manual' | 'vision_edited'
+  extra_data?: Record<string, unknown>
+}
+
+export async function updateSnapshot(
+  id: string,
+  payload: UpdateSnapshotPayload
+): Promise<FuelSnapshot> {
+  const headers = getWriteHeaders({ 'Content-Type': 'application/json' })
+  const res = await fetch(`${API_BASE}/api/snapshots/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(payload),
+  })
+
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}))
+    const err = new Error(errBody.detail || `Failed to update snapshot (${res.status})`)
+    if (res.status === 401) {
+      ;(err as any).isAuthError = true
+    }
+    throw err
+  }
+  return res.json()
+}
+
+export async function fetchLatestSnapshot(): Promise<FuelSnapshot | null> {
+  const res = await fetch(`${API_BASE}/api/snapshots/latest`)
+  if (!res.ok) return null
+  const data = await res.json()
+  return data.latest || null
 }

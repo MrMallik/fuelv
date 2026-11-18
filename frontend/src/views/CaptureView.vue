@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
 import CameraModal from '../components/CameraModal.vue'
 import KeySettingsModal from '../components/KeySettingsModal.vue'
 import UiBadge from '../components/ui/UiBadge.vue'
@@ -9,6 +9,7 @@ import UiInput from '../components/ui/UiInput.vue'
 import {
   createSnapshot,
   extractFromImages,
+  fetchLatestSnapshot,
   type ExtractedFuelData,
 } from '../services/api'
 
@@ -32,12 +33,63 @@ const rawExtractionJson = ref<ExtractedFuelData | null>(null)
 const savedOdoPath = ref<string | null>(null)
 const savedPumpPath = ref<string | null>(null)
 
+// Previous odometer reading for telemetry efficiency
+const previousOdometer = ref<number | null>(null)
+
+onMounted(async () => {
+  try {
+    const latest = await fetchLatestSnapshot()
+    if (latest && latest.odometer_reading != null) {
+      previousOdometer.value = latest.odometer_reading
+    }
+  } catch {
+    // Graceful fallback: non-blocking
+  }
+})
+
 // Form state
 const step = ref<'capture' | 'confirm'>('capture')
 const odometerReading = ref<string>('')
 const totalExpense = ref<string>('')
 const fuelDispensed = ref<string>('')
 const capturedAt = ref<string>(toLocalDatetimeInput(new Date()))
+
+// Real-time computed fuel efficiency (km/L)
+const liveEfficiency = computed(() => {
+  const odo = parseFloat(odometerReading.value)
+  const fuel = parseFloat(fuelDispensed.value)
+  if (isNaN(odo) || isNaN(fuel) || fuel <= 0) return null
+
+  if (previousOdometer.value === null) {
+    return {
+      isFirstLog: true,
+      isInvalidOdo: false,
+      distanceDelta: 0,
+      kmPerL: null,
+      previousOdometer: null,
+    }
+  }
+
+  if (odo < previousOdometer.value) {
+    return {
+      isFirstLog: false,
+      isInvalidOdo: true,
+      distanceDelta: Math.round((odo - previousOdometer.value) * 10) / 10,
+      kmPerL: null,
+      previousOdometer: previousOdometer.value,
+    }
+  }
+
+  const delta = Math.round((odo - previousOdometer.value) * 10) / 10
+  const kmpl = Math.round((delta / fuel) * 100) / 100
+  return {
+    isFirstLog: false,
+    isInvalidOdo: false,
+    distanceDelta: delta,
+    kmPerL: kmpl,
+    previousOdometer: previousOdometer.value,
+  }
+})
 
 // Optional extensible extra_data fields
 const showExtra = ref(false)
@@ -97,6 +149,10 @@ async function runExtraction() {
     savedPumpPath.value = res.meta.pump_image_path
     extractionWarning.value = res.meta.warning
 
+    if (res.efficiency?.previous_odometer != null) {
+      previousOdometer.value = res.efficiency.previous_odometer
+    }
+
     if (res.extraction.odometer_reading !== null) {
       odometerReading.value = String(res.extraction.odometer_reading)
     }
@@ -154,6 +210,14 @@ async function submitSnapshot() {
     if (stationName.value.trim()) extra.station = stationName.value.trim()
     if (notes.value.trim()) extra.notes = notes.value.trim()
 
+    if (liveEfficiency.value && !liveEfficiency.value.isFirstLog && !liveEfficiency.value.isInvalidOdo) {
+      if (liveEfficiency.value.kmPerL != null) {
+        extra.km_per_l = liveEfficiency.value.kmPerL
+      }
+      extra.distance_delta = liveEfficiency.value.distanceDelta
+      extra.previous_odometer = liveEfficiency.value.previousOdometer
+    }
+
     const isoTime = capturedAt.value
       ? new Date(capturedAt.value).toISOString()
       : new Date().toISOString()
@@ -175,7 +239,7 @@ async function submitSnapshot() {
     if ((err as any)?.isAuthError) {
       showKeyModal.value = true
     }
-    saveError.value = err instanceof Error ? err.message : 'Failed to save snapshot'
+    saveError.value = err instanceof Error ? err.message : 'Failed to save fuel log'
   } finally {
     saving.value = false
   }
@@ -184,13 +248,21 @@ async function submitSnapshot() {
 
 <template>
   <section>
+    <div style="margin-bottom: 1rem">
+      <RouterLink to="/" class="text-link" style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8125rem">
+        <!-- Arrow Left -->
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+        Back to Fuel Logs
+      </RouterLink>
+    </div>
+
     <header class="page-header">
       <p class="page-eyebrow">FuelV</p>
       <div style="display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 1.5rem">
         <div>
-          <h1 class="page-title">Capture Snapshot</h1>
+          <h1 class="page-title">Log Fuel</h1>
           <p class="page-description">
-            Select from files or capture using your camera for both the odometer and fuel pump display.
+            Capture or upload odometer and pump display photos for instant AI extraction.
           </p>
         </div>
 
@@ -367,6 +439,25 @@ async function submitSnapshot() {
         <pre style="margin: 0">{{ JSON.stringify(rawExtractionJson, null, 2) }}</pre>
       </div>
 
+      <!-- Real-time Fuel Efficiency Card -->
+      <div v-if="liveEfficiency" class="efficiency-banner">
+        <div v-if="liveEfficiency.isFirstLog" style="font-size: 0.8125rem; color: var(--muted-foreground)">
+          ⚡ <strong>First Log Baseline:</strong> Sets initial odometer at {{ odometerReading || '0' }} km. Fuel efficiency (km/L) will start calculating on your next fill-up.
+        </div>
+        <div v-else-if="liveEfficiency.isInvalidOdo" style="font-size: 0.8125rem; color: #ef4444">
+          ⚠️ Current odometer ({{ odometerReading }} km) is lower than previous log ({{ liveEfficiency.previousOdometer }} km).
+        </div>
+        <div v-else class="efficiency-content">
+          <div class="efficiency-main">
+            <span class="efficiency-label">Estimated Fuel Efficiency</span>
+            <strong class="efficiency-value">{{ liveEfficiency.kmPerL }} <span class="efficiency-unit">km/L</span></strong>
+          </div>
+          <div class="efficiency-sub">
+            +{{ liveEfficiency.distanceDelta }} km since last log ({{ liveEfficiency.previousOdometer }} km) · {{ fuelDispensed }} L dispensed
+          </div>
+        </div>
+      </div>
+
       <div class="form-grid">
         <div class="field-group">
           <label for="odo-input" class="field-label">Odometer Reading (km)</label>
@@ -469,7 +560,7 @@ async function submitSnapshot() {
         </UiButton>
 
         <UiButton type="submit" variant="default" :disabled="saving">
-          {{ saving ? 'Saving…' : 'Save snapshot' }}
+          {{ saving ? 'Saving…' : 'Save fuel log' }}
         </UiButton>
       </div>
     </form>
