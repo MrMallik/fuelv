@@ -91,7 +91,7 @@ class GeminiFlashExtractor:
 
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_id}:generateContent?key={self.api_key}"
+            f"{self.model_id}:generateContent"
         )
         payload = {
             "contents": [{"parts": parts}],
@@ -105,7 +105,10 @@ class GeminiFlashExtractor:
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+            },
             method="POST",
         )
 

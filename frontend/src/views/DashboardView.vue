@@ -19,6 +19,7 @@ import {
   type GroupByPeriod,
   type GroupedSnapshotsResponse,
 } from '../services/api'
+import { clearDraftState, getActiveDraftSummary } from '../services/draftStorage'
 
 const STORAGE_MODE_KEY = 'fuelv_timeline_mode'
 const STORAGE_METRIC_KEY = 'fuelv_heatmap_metric'
@@ -61,6 +62,21 @@ const pageSize = ref(10)
 
 // Active log being edited
 const editingLog = ref<FuelSnapshot | null>(null)
+const actionError = ref<string | null>(null)
+const pendingDraft = ref<{ hasDraft: boolean; photoCount: number; hasNumbers: boolean }>({
+  hasDraft: false,
+  photoCount: 0,
+  hasNumbers: false,
+})
+
+async function checkPendingDraft() {
+  pendingDraft.value = await getActiveDraftSummary()
+}
+
+async function dismissPendingDraft() {
+  await clearDraftState()
+  await checkPendingDraft()
+}
 
 const allLogs = computed<FuelSnapshot[]>(() => {
   if (!data.value) return []
@@ -186,6 +202,7 @@ watch(groupBy, (newMode) => {
 
 onMounted(() => {
   loadData()
+  checkPendingDraft()
 })
 
 function onHeatmapSelectPeriod(periodKey: string) {
@@ -250,14 +267,16 @@ function entryBadgeLabel(mode: FuelSnapshot['entry_mode']): string {
 
 async function handleDelete(id: string) {
   if (!confirm('Delete this fuel log?')) return
+  actionError.value = null
   try {
     await deleteSnapshot(id)
     await loadData()
   } catch (err: unknown) {
     if ((err as any)?.isAuthError) {
-      alert('Unauthorized: Configure your Admin Access Key (UUID) in the top navbar to delete entries.')
+      actionError.value =
+        'Unauthorized: Configure your Admin Access Key (UUID) in the top navbar to delete logs.'
     } else {
-      alert(err instanceof Error ? err.message : 'Delete failed')
+      actionError.value = err instanceof Error ? err.message : 'Delete failed'
     }
   }
 }
@@ -276,6 +295,43 @@ function openImage(url: string | null, title: string) {
     <header class="page-header" style="margin-bottom: 1.5rem">
       <h1 class="page-title">Dashboard</h1>
     </header>
+
+    <!-- Resume Unsaved Local Draft Banner -->
+    <div
+      v-if="pendingDraft.hasDraft"
+      class="period-drilldown-banner"
+      style="border-left-color: #10b981; margin-top: 0; margin-bottom: 1.25rem"
+    >
+      <div class="period-drilldown-title">
+        <span>📸 Unsaved Fuel Log on This Device</span>
+        <UiBadge variant="outline">
+          <template v-if="pendingDraft.photoCount > 0">
+            {{ pendingDraft.photoCount }} {{ pendingDraft.photoCount === 1 ? 'photo' : 'photos' }} retained
+          </template>
+          <template v-else>
+            Draft numbers saved
+          </template>
+        </UiBadge>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0.5rem">
+        <RouterLink to="/capture" class="ui-btn ui-btn-default ui-btn-sm" style="text-decoration: none">
+          Resume Log →
+        </RouterLink>
+        <UiButton variant="ghost" size="sm" @click="dismissPendingDraft">
+          Discard
+        </UiButton>
+      </div>
+    </div>
+
+    <!-- Action Error Banner -->
+    <div
+      v-if="actionError"
+      class="notice-banner"
+      style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-color: #ef4444; color: #ef4444"
+    >
+      <span>{{ actionError }}</span>
+      <UiButton variant="ghost" size="sm" @click="actionError = null">Dismiss</UiButton>
+    </div>
 
     <!-- ROW 1: Executive Summary -->
     <div v-if="data && data.total_snapshots > 0" class="executive-summary">

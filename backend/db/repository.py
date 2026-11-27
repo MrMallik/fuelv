@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator, Literal
 
+from ..storage.r2 import resolve_image_url
+
 GroupByPeriod = Literal["day", "week", "month", "year"]
 
 PERIOD_FORMATS: dict[GroupByPeriod, str] = {
@@ -38,10 +40,16 @@ class SnapshotRepository:
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA foreign_keys = ON;")
         try:
             yield conn
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -180,6 +188,7 @@ class SnapshotRepository:
 
         with self._connect() as conn:
             extra_json_str = json.dumps(extra_dict)
+            conn.execute("BEGIN IMMEDIATE")
 
             conn.execute(
                 """
@@ -252,29 +261,34 @@ class SnapshotRepository:
         entry_mode: str | None = None,
         extra_data: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        current = self.get_snapshot(snapshot_id)
-        if not current:
-            return None
-
-        new_odo = float(odometer_reading) if odometer_reading is not None else float(current["odometer_reading"])
-        new_exp = float(total_expense) if total_expense is not None else float(current["total_expense"])
-        new_fuel = float(fuel_dispensed) if fuel_dispensed is not None else float(current["fuel_dispensed"])
-        new_captured_at = captured_at if captured_at is not None else current["captured_at"]
-
-        current_extra = dict(current.get("extra_data") or {})
-        if extra_data:
-            current_extra.update(extra_data)
-
-        # Detect entry_mode update
-        resolved_mode = entry_mode or current["entry_mode"]
-        if resolved_mode == "vision" and (
-            abs(new_odo - float(current["odometer_reading"])) > 1e-4
-            or abs(new_exp - float(current["total_expense"])) > 1e-4
-            or abs(new_fuel - float(current["fuel_dispensed"])) > 1e-4
-        ):
-            resolved_mode = "vision_edited"
-
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM fuel_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            current = self._row_to_dict(row)
+            new_odo = float(odometer_reading) if odometer_reading is not None else float(current["odometer_reading"])
+            new_exp = float(total_expense) if total_expense is not None else float(current["total_expense"])
+            new_fuel = float(fuel_dispensed) if fuel_dispensed is not None else float(current["fuel_dispensed"])
+            new_captured_at = captured_at if captured_at is not None else current["captured_at"]
+
+            current_extra = dict(current.get("extra_data") or {})
+            if extra_data:
+                current_extra.update(extra_data)
+
+            # Detect entry_mode update
+            resolved_mode = entry_mode or current["entry_mode"]
+            if resolved_mode == "vision" and (
+                abs(new_odo - float(current["odometer_reading"])) > 1e-4
+                or abs(new_exp - float(current["total_expense"])) > 1e-4
+                or abs(new_fuel - float(current["fuel_dispensed"])) > 1e-4
+            ):
+                resolved_mode = "vision_edited"
+
             conn.execute(
                 """
                 UPDATE fuel_snapshots
@@ -304,6 +318,7 @@ class SnapshotRepository:
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute("DELETE FROM fuel_snapshots WHERE id = ?", (snapshot_id,))
             if cursor.rowcount > 0:
                 self._recalculate_chronological_chain(conn)
@@ -387,8 +402,8 @@ class SnapshotRepository:
             "captured_at": row["captured_at"],
             "odo_image_path": odo_path,
             "pump_image_path": pump_path,
-            "odo_image_url": f"/api/images/{Path(odo_path).name}" if odo_path else None,
-            "pump_image_url": f"/api/images/{Path(pump_path).name}" if pump_path else None,
+            "odo_image_url": resolve_image_url(odo_path),
+            "pump_image_url": resolve_image_url(pump_path),
             "odometer_reading": row["odometer_reading"],
             "total_expense": row["total_expense"],
             "fuel_dispensed": row["fuel_dispensed"],

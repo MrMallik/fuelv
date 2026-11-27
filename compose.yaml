@@ -14,9 +14,20 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
       CUSTOM_EXTRACTOR_URL: ${CUSTOM_EXTRACTOR_URL:-http://localhost:8080/predict}
       CUSTOM_EXTRACTOR_MODEL_ID: ${CUSTOM_EXTRACTOR_MODEL_ID:-custom-fuel-ft-v1}
+      CUSTOM_EXTRACTOR_API_KEY: ${CUSTOM_EXTRACTOR_API_KEY:-}
       FUELV_DB_PATH: /app/data/fuelv.db
       FUELV_IMAGES_DIR: /app/data/images
       FUELV_WRITE_KEY: ${FUELV_WRITE_KEY:-}
+      FUELV_DISABLE_AUTH: ${FUELV_DISABLE_AUTH:-}
+      FUELV_SKIP_STARTUP_VALIDATION: ${FUELV_SKIP_STARTUP_VALIDATION:-}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-d2fe1099fc2a477abb4fd83b85d0cfe6}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-public-bucket}
+      R2_KEY_PREFIX: ${R2_KEY_PREFIX:-fvs}
+      R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-https://r2.pritabrata.com}
+      R2_REQUIRE_CREDENTIALS: ${R2_REQUIRE_CREDENTIALS:-true}
     volumes:
       - fuelv_data:/app/data
     networks:

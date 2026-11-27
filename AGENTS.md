@@ -53,8 +53,9 @@ The application feeds these images through a Vision-Language Model (VLM) pipelin
                                 │                   │
               ┌─────────────────┴────┐        ┌─────┴────────────────┐
               ▼                      ▼        ▼                      ▼
-      SQLite3 (WAL Mode)       Disk Storage   Gemini 3.5 Flash Lite  Custom Model
-      `data/fuelv.db`          `data/images/` (Default VLM)          (Self-Hosted)
+      SQLite3 (WAL Mode)     Cloudflare R2    Gemini 3.5 Flash Lite  Custom Model
+      `data/fuelv.db`        `public-bucket`  (Default VLM)          (Self-Hosted)
+                             `fvs/<file>`
 ```
 
 ### Tech Stack:
@@ -78,6 +79,11 @@ fuelv/
 │   ├── extraction/
 │   │   ├── base.py              # Base extractor class & swappable factory
 │   │   └── gemini.py            # Gemini 3.5 Flash Lite VLM extraction implementation
+│   ├── scripts/
+│   │   ├── import_csv.py        # Fuelio CSV import utility
+│   │   └── migrate_images_to_r2.py # Production local-to-Cloudflare-R2 image migrator
+│   ├── storage/
+│   │   └── r2.py                # Cloudflare R2 (public-bucket/fvs/) SigV4 client
 │   ├── tests/
 │   │   ├── test_backend.py      # Core unit tests (normalization, repository, auth)
 │   │   └── test_intensive_qa_security.py # Intensive QA & security attack vector suite
@@ -96,7 +102,10 @@ fuelv/
 │   │   ├── assets/logo/         # Multi-resolution brandmark PNG suite (1024px to 16px)
 │   │   ├── components/          # Reusable UI components (Heatmap, CameraModal, EditLogModal)
 │   │   ├── router/index.ts      # Vue Router routes
-│   │   ├── services/api.ts      # REST API client & localStorage state management
+│   │   ├── services/
+│   │   │   ├── api.ts           # REST API client with timeout/retry & localStorage state
+│   │   │   ├── draftStorage.ts  # Client IndexedDB draft & photo persistence across refreshes
+│   │   │   └── imageOptimizer.ts # Client-side canvas compression (~250KB high-clarity JPEG)
 │   │   ├── views/               # Single-page views (DashboardView, CaptureView)
 │   │   ├── App.vue              # App shell & header navigation
 │   │   └── style.css            # Dark-theme design tokens & typography
@@ -130,28 +139,53 @@ fuelv/
 5. **Mobile Viewport Constraints**:
    - Enforce `font-size: 16px !important` on mobile form inputs to prevent iOS Safari auto-zoom on focus.
    - Set `<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />` in `frontend/index.html`.
+6. **Strict Test-Driven Development (TDD) Mandate**:
+   - This repository is strictly built using Test-Driven Development (TDD). For any new feature, bug fix, or refactor, write comprehensive tests **BEFORE** writing production code.
+   - Test suites are organized under `backend/tests/`:
+     - `backend/tests/feature/`: Specification tests for new features, domain contracts, and user flows.
+     - `backend/tests/regression/`: Regression test suites verifying that existing system guarantees (e.g. chronological chain recalculation, Cloudflare R2 SigV4 uploads, UUID write-key timing-safe checks, SQLite WAL concurrency, draft restoration) never break.
+     - Root `backend/tests/`: Baseline unit and configuration tests (`test_backend.py`, `test_config.py`, `test_intensive_qa_security.py`).
+   - Every test must be runnable via standard Python `unittest discover`.
 
 ---
 
 ## 5. Development & Testing Commands
 
-### Python Environment
-The local development environment uses `.venv/`:
+### Mise Polyglot Tool Manager (Recommended)
+This repository uses [mise](https://mise.jdx.dev) (`.mise.toml`) to pin **Python 3.12** and **Node 22**, auto-activate `.venv`, auto-load `.env`, and provide unified tasks:
 ```bash
-# Run all backend unit and security tests
+# First-time setup (installs runtimes and packages)
+mise run setup
+
+# Run all 82 backend tests + frontend production build
+mise run test
+
+# Run backend tests only
+mise run test:backend
+
+# Run feature or regression tests individually
+mise run test:feature
+mise run test:regression
+
+# Start simultaneous local development (Backend :8000 + Frontend :5173)
+mise run dev
+
+# Validate shell syntax & TypeScript types
+mise run lint
+```
+
+### Direct Tooling Fallbacks (Without Mise)
+#### Python Backend Tests
+```bash
 .venv/bin/python3 -m unittest discover -s backend/tests -p "test_*.py" -v
 ```
 
-### Frontend Build & Lint
+#### Frontend Build & Lint
 ```bash
-# In frontend directory
-export PATH="/opt/homebrew/bin:$PATH"
-cd frontend
-npm install
-npm run build
+cd frontend && npm install && npm run build
 ```
 
-### Simultaneous Local Dev Server
+#### Simultaneous Local Dev Server
 ```bash
 ./dev.sh
 # Backend runs on http://127.0.0.1:8000

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Protocol, TypedDict
 
@@ -26,7 +27,9 @@ def normalize_extracted_json(payload: dict[str, Any] | None) -> ExtractedFuelDat
             return None
         try:
             num = float(val)
-            return round(num, 3) if num >= 0 else None
+            if not math.isfinite(num) or num < 0:
+                return None
+            return round(num, 3)
         except (TypeError, ValueError):
             return None
 
