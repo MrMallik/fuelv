@@ -20,9 +20,16 @@ if [[ ! -f "$env_file" ]]; then
 EXTRACTOR_BACKEND=gemini
 GEMINI_API_KEY=replace_with_your_gemini_api_key
 GEMINI_MODEL=gemini-3.5-flash-lite
+FUELV_WRITE_KEY=replace_with_your_uuid_write_key
+R2_ACCOUNT_ID=d2fe1099fc2a477abb4fd83b85d0cfe6
+R2_ACCESS_KEY_ID=replace_with_your_r2_access_key_id
+R2_SECRET_ACCESS_KEY=replace_with_your_r2_secret_access_key
+R2_BUCKET_NAME=public-bucket
+R2_KEY_PREFIX=fvs
+R2_PUBLIC_BASE_URL=https://r2.pritabrata.com
 EOF
 	chmod 600 "$env_file"
-	printf 'Created %s — edit it to set your GEMINI_API_KEY before running GitHub Actions deploy.\n' "$env_file"
+	printf 'Created %s — edit it to set your GEMINI_API_KEY, FUELV_WRITE_KEY, and R2 credentials before running GitHub Actions deploy.\n' "$env_file"
 else
 	printf 'Existing %s found.\n' "$env_file"
 fi

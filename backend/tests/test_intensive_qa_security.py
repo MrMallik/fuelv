@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +19,18 @@ class TestSecurityAndAccessControl(unittest.TestCase):
     """Rigorous Offensive and Defensive Security Tests for FuelV."""
 
     def setUp(self) -> None:
+        self.test_env_patcher = patch.dict(
+            os.environ,
+            {
+                "FUELV_DISABLE_AUTH": "0",
+                "R2_ACCOUNT_ID": "test_account_12345",
+                "R2_ACCESS_KEY_ID": "test_access_key",
+                "R2_SECRET_ACCESS_KEY": "test_secret_key",
+                "R2_BUCKET_NAME": "public-bucket",
+                "R2_PUBLIC_BASE_URL": "https://r2.pritabrata.com",
+            },
+        )
+        self.test_env_patcher.start()
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp_dir.name) / "test_security.db"
         self.img_dir = Path(self.tmp_dir.name) / "images"
@@ -29,6 +41,7 @@ class TestSecurityAndAccessControl(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
+        self.test_env_patcher.stop()
         self.tmp_dir.cleanup()
 
     # -------------------------------------------------------------------------
@@ -157,35 +170,154 @@ class TestSecurityAndAccessControl(unittest.TestCase):
                 self.assertTrue(mock_compare.called, "hmac.compare_digest must be invoked for timing safety")
 
     # -------------------------------------------------------------------------
-    # 2. Path Traversal & LFI Attack Resistance
+    # 2. Path Traversal, Stateless Extract & R2 Upload Sanitization
     # -------------------------------------------------------------------------
     def test_image_upload_path_traversal_and_extension_sanitization(self) -> None:
-        """Malicious upload filenames must be sanitized to prevent directory traversal or arbitrary file writing."""
+        """1) /api/extract must be purely in-memory and NEVER write images to local disk or R2.
+        2) POST /api/snapshots with multipart files must sanitize malicious filenames, store in R2 `fvs/`,
+           resolve to https://r2.pritabrata.com/fvs/..., and NEVER write to local disk.
+        """
         headers = {"X-FuelV-Key": self.test_write_key}
+        fake_ext = MagicMock()
+        fake_ext.model_id = "gemini-3.5-flash-lite"
+        fake_ext.extract.return_value = {
+            "odometer_reading": 14520.5,
+            "total_expense": 550.0,
+            "fuel_dispensed": 5.38,
+        }
         with patch.dict(os.environ, {"FUELV_WRITE_KEY": self.test_write_key}):
-            malicious_filenames = [
-                "../../../../etc/passwd.exe",
-                "../../main.py",
-                "..\\..\\windows\\system32\\cmd.exe",
-                "shell.php",
-                "exploit.py",
-                "test.jpg/../../evil.sh",
-            ]
+            with patch("backend.main.get_extractor", return_value=fake_ext), patch.object(
+                self.app.state.r2,
+                "upload_image",
+                side_effect=lambda data, filename, content_type="image/jpeg", max_retries=3: self.app.state.r2.build_object_key(filename),
+            ):
+                malicious_filenames = [
+                    "../../../../etc/passwd.exe",
+                    "../../main.py",
+                    "..\\..\\windows\\system32\\cmd.exe",
+                    "shell.php",
+                    "exploit.py",
+                    "test.jpg/../../evil.sh",
+                ]
 
-            for fname in malicious_filenames:
-                files = {"odo_image": (fname, b"fake_content", "image/jpeg")}
-                res = self.client.post("/api/extract", headers=headers, files=files)
-                self.assertEqual(res.status_code, 200)
+                for idx, fname in enumerate(malicious_filenames):
+                    # 1. Stateless /api/extract must not write any files anywhere
+                    files = {"odo_image": (fname, b"fake_content", "image/jpeg")}
+                    res = self.client.post("/api/extract", headers=headers, files=files)
+                    self.assertEqual(res.status_code, 200)
+                    self.assertIsNone(res.json()["meta"]["odo_image_path"])
+                    self.assertEqual(list(self.img_dir.iterdir()), [])
 
-                saved_rel_path = res.json()["meta"]["odo_image_path"]
-                self.assertIsNotNone(saved_rel_path)
-                self.assertTrue(saved_rel_path.startswith("images/"))
-                self.assertTrue(saved_rel_path.endswith(".jpg"))
+                    # 2. Final confirmed save (POST /api/snapshots) sanitizes extension & stores under fvs/
+                    snap_res = self.client.post(
+                        "/api/snapshots",
+                        headers=headers,
+                        data={
+                            "odometer_reading": str(10000 + idx * 100),
+                            "total_expense": "500.0",
+                            "fuel_dispensed": "5.0",
+                        },
+                        files={"odo_image": (fname, b"fake_image_bytes", "image/jpeg")},
+                    )
+                    self.assertEqual(snap_res.status_code, 201)
+                    body = snap_res.json()
+                    saved_r2_key = body["odo_image_path"]
+                    self.assertIsNotNone(saved_r2_key)
+                    self.assertTrue(saved_r2_key.startswith("fvs/"))
+                    self.assertTrue(saved_r2_key.endswith("_odo.jpg"))
+                    self.assertNotIn("..", saved_r2_key)
+                    self.assertTrue(
+                        body["odo_image_url"].startswith("https://r2.pritabrata.com/fvs/")
+                    )
 
-                # Verify file was written inside images directory and nowhere else
-                saved_file = self.img_dir / Path(saved_rel_path).name
-                self.assertTrue(saved_file.is_file())
-                self.assertTrue(saved_file.resolve().is_relative_to(self.img_dir.resolve()))
+                    # Confirm zero files were written to the local device/container disk
+                    self.assertEqual(list(self.img_dir.iterdir()), [])
+
+    def test_r2_storage_sigv4_and_prod_migration_script(self) -> None:
+        """Verify Cloudflare R2 SigV4 signing and production migration of 2 logs (4 captures) to fvs/."""
+        from backend.scripts.migrate_images_to_r2 import migrate_local_images_to_r2
+        from backend.storage.r2 import R2Storage
+
+        # 1. Verify SigV4 header construction for public-bucket/fvs/
+        r2 = R2Storage(
+            account_id="d2fe1099fc2a477abb4fd83b85d0cfe6",
+            access_key_id="test_access_key",
+            secret_access_key="test_secret_key",
+            bucket_name="public-bucket",
+            key_prefix="fvs",
+            public_base_url="https://r2.pritabrata.com",
+        )
+        self.assertTrue(r2.is_configured)
+        url, signed_headers = r2._build_signed_headers(
+            method="PUT",
+            object_key="fvs/sample_odo.jpg",
+            payload=b"jpeg_bytes",
+            extra_headers={"Content-Type": "image/jpeg"},
+        )
+        self.assertEqual(
+            url,
+            "https://d2fe1099fc2a477abb4fd83b85d0cfe6.r2.cloudflarestorage.com/public-bucket/fvs/sample_odo.jpg",
+        )
+        self.assertIn("AWS4-HMAC-SHA256 Credential=test_access_key/", signed_headers["Authorization"])
+        self.assertIn("auto/s3/aws4_request", signed_headers["Authorization"])
+
+        # 2. Simulate the 2 production logs (4 local captures) and migrate them to R2 fvs/
+        files_created: list[Path] = []
+        for i in (1, 2):
+            odo_file = self.img_dir / f"prod_log{i}_odo.jpg"
+            pump_file = self.img_dir / f"prod_log{i}_pump.jpg"
+            odo_file.write_bytes(f"odo_bytes_{i}".encode())
+            pump_file.write_bytes(f"pump_bytes_{i}".encode())
+            files_created.extend([odo_file, pump_file])
+
+            self.app.state.repo.insert_snapshot(
+                captured_at=f"2026-11-1{i}T10:00:00+05:30",
+                odometer_reading=10000.0 + i * 250.0,
+                total_expense=500.0,
+                fuel_dispensed=5.0,
+                odo_image_path=f"images/prod_log{i}_odo.jpg",
+                pump_image_path=f"images/prod_log{i}_pump.jpg",
+            )
+
+        uploaded_store: dict[str, bytes] = {}
+
+        def fake_upload(data: bytes, filename: str, content_type: str = "image/jpeg", max_retries: int = 3) -> str:
+            key = r2.build_object_key(filename)
+            uploaded_store[key] = data
+            return key
+
+        def fake_head(object_key: str) -> bool:
+            return object_key in uploaded_store
+
+        with patch.object(r2, "upload_image", side_effect=fake_upload), patch.object(
+            r2, "head_image", side_effect=fake_head
+        ):
+            summary = migrate_local_images_to_r2(
+                db_path=self.db_path,
+                images_dir=self.img_dir,
+                storage=r2,
+                delete_local=True,
+                dry_run=False,
+            )
+
+        self.assertEqual(summary["updated_rows"], 2)
+        self.assertEqual(summary["migrated_files"], 4)
+        self.assertEqual(summary["deleted_local_files"], 4)
+        self.assertEqual(summary["errors"], [])
+
+        # Confirm all 4 local files were deleted after R2 verification
+        for f in files_created:
+            self.assertFalse(f.exists())
+
+        # Confirm DB rows now point to fvs/... and resolve to https://r2.pritabrata.com/fvs/...
+        grouped = self.app.state.repo.get_grouped_snapshots("month")
+        all_snaps = [s for g in grouped["groups"] for s in g["snapshots"]]
+        self.assertEqual(len(all_snaps), 2)
+        for snap in all_snaps:
+            self.assertTrue(snap["odo_image_path"].startswith("fvs/prod_log"))
+            self.assertTrue(snap["pump_image_path"].startswith("fvs/prod_log"))
+            self.assertTrue(snap["odo_image_url"].startswith("https://r2.pritabrata.com/fvs/prod_log"))
+            self.assertTrue(snap["pump_image_url"].startswith("https://r2.pritabrata.com/fvs/prod_log"))
 
     def test_api_images_path_traversal_rejection(self) -> None:
         """Static file mount for images must block directory escape attempts."""
@@ -280,11 +412,208 @@ class TestSecurityAndAccessControl(unittest.TestCase):
 
         self.assertTrue(hit_429, "Rate limiter should have returned 429 after exceeding 60 requests/min")
 
+    def test_stored_xss_mime_sanitization_and_r2_key_traversal_defense(self) -> None:
+        """Block SVG/HTML MIME types on image upload, normalize octet-stream, and reject key traversal."""
+        from backend.storage.r2 import R2Storage, resolve_image_url
+
+        headers = {"X-FuelV-Key": self.test_write_key}
+        captured_mimes: list[str] = []
+
+        def fake_upload(data: bytes, filename: str, content_type: str = "image/jpeg", max_retries: int = 3) -> str:
+            captured_mimes.append(content_type)
+            return self.app.state.r2.build_object_key(filename)
+
+        with patch.dict(os.environ, {"FUELV_WRITE_KEY": self.test_write_key, "FUELV_DISABLE_AUTH": "0"}):
+            with patch.object(self.app.state.r2, "upload_image", side_effect=fake_upload):
+                # 1. HTML / SVG MIME uploads must be rejected (prevents Stored XSS on public R2 origin)
+                for evil_mime in ("text/html", "image/svg+xml", "application/javascript"):
+                    res = self.client.post(
+                        "/api/snapshots",
+                        headers=headers,
+                        data={"odometer_reading": "1000", "total_expense": "100", "fuel_dispensed": "1"},
+                        files={"odo_image": ("evil.jpg", b"<script>alert(1)</script>", evil_mime)},
+                    )
+                    self.assertEqual(res.status_code, 400, f"Expected 400 for MIME {evil_mime}")
+
+                # 2. application/octet-stream falls back safely to extension MIME
+                res_ok = self.client.post(
+                    "/api/snapshots",
+                    headers=headers,
+                    data={"odometer_reading": "1000", "total_expense": "100", "fuel_dispensed": "1"},
+                    files={"odo_image": ("photo.png", b"png_bytes", "application/octet-stream")},
+                )
+                self.assertEqual(res_ok.status_code, 201)
+                self.assertEqual(captured_mimes[-1], "image/png")
+
+            # 3. JSON path traversal / non-http scheme in odo_image_path rejected with 422
+            for bad_path in ("fvs/../secret.jpg", "..\\evil.jpg", "javascript:alert(1)"):
+                res_bad_json = self.client.post(
+                    "/api/snapshots",
+                    headers=headers,
+                    json={
+                        "odometer_reading": 1000.0,
+                        "total_expense": 100.0,
+                        "fuel_dispensed": 1.0,
+                        "odo_image_path": bad_path,
+                    },
+                )
+                self.assertEqual(res_bad_json.status_code, 422)
+
+        # 4. R2Storage cross-platform traversal & delete/resolve protections
+        r2 = R2Storage(
+            account_id="acct",
+            access_key_id="key",
+            secret_access_key="secret",
+            bucket_name="public-bucket",
+            key_prefix="fvs",
+            public_base_url="https://r2.pritabrata.com",
+        )
+        self.assertEqual(r2.build_object_key("..\\..\\windows\\evil.jpg"), "fvs/evil.jpg")
+        with self.assertRaises(ValueError):
+            r2.build_object_key("..")
+        self.assertFalse(r2.delete_image("fvs/../other-prefix/secret.jpg"))
+        self.assertIsNone(resolve_image_url("fvs\\..\\secret.jpg"))
+        self.assertNotEqual(resolve_image_url("fvs/../other/secret.jpg"), "https://r2.pritabrata.com/fvs/../other/secret.jpg")
+
+    def test_r2_upload_rollback_and_error_redaction_and_retry_policy(self) -> None:
+        """Verify compensating R2 delete on second-file failure, redacted 502 error, and no retry on 403."""
+        from unittest.mock import MagicMock
+        from backend.storage.r2 import R2Storage
+
+        headers = {"X-FuelV-Key": self.test_write_key}
+        deleted_keys: list[str | None] = []
+
+        def upload_side_effect(data: bytes, filename: str, content_type: str = "image/jpeg", max_retries: int = 3) -> str:
+            if "_pump" in filename:
+                raise RuntimeError("R2 PUT failed with HTTP 500: <Error><AWSAccessKeyId>SECRET_ID</AWSAccessKeyId></Error>")
+            return self.app.state.r2.build_object_key(filename)
+
+        with patch.dict(os.environ, {"FUELV_WRITE_KEY": self.test_write_key, "FUELV_DISABLE_AUTH": "0"}):
+            with patch("backend.main.logger"), patch.object(
+                self.app.state.r2, "upload_image", side_effect=upload_side_effect
+            ), patch.object(
+                self.app.state.r2, "delete_image", side_effect=lambda k: deleted_keys.append(k) or True
+            ):
+                res = self.client.post(
+                    "/api/snapshots",
+                    headers=headers,
+                    data={"odometer_reading": "1000", "total_expense": "100", "fuel_dispensed": "1"},
+                    files={
+                        "odo_image": ("odo.jpg", b"odo_bytes", "image/jpeg"),
+                        "pump_image": ("pump.jpg", b"pump_bytes", "image/jpeg"),
+                    },
+                )
+                self.assertEqual(res.status_code, 502)
+                self.assertNotIn("SECRET_ID", res.json()["detail"])
+                self.assertNotIn("<Error>", res.json()["detail"])
+                self.assertEqual(len(deleted_keys), 1)
+                self.assertTrue(deleted_keys[0].startswith("fvs/") and deleted_keys[0].endswith("_odo.jpg"))
+
+        # Verify 403 does not retry, while 503 retries
+        r2 = R2Storage(
+            account_id="acct",
+            access_key_id="key",
+            secret_access_key="secret",
+            bucket_name="public-bucket",
+            key_prefix="fvs",
+            public_base_url="https://r2.pritabrata.com",
+        )
+        mock_client = MagicMock()
+        mock_resp_403 = MagicMock(status_code=403, text="<Error>SignatureDoesNotMatch</Error>")
+        mock_client.put.return_value = mock_resp_403
+        with patch.object(r2, "_get_client", return_value=mock_client), patch("time.sleep"):
+            with self.assertRaises(RuntimeError):
+                r2.upload_image(b"abc", "a.jpg", max_retries=3)
+            self.assertEqual(mock_client.put.call_count, 1)
+
+        mock_client.reset_mock()
+        mock_resp_503 = MagicMock(status_code=503, text="SlowDown")
+        mock_resp_200 = MagicMock(status_code=200, text="")
+        mock_client.put.side_effect = [mock_resp_503, mock_resp_200]
+        with patch.object(r2, "_get_client", return_value=mock_client), patch("time.sleep"):
+            key = r2.upload_image(b"abc", "a.jpg", max_retries=3)
+            self.assertEqual(key, "fvs/a.jpg")
+            self.assertEqual(mock_client.put.call_count, 2)
+
+    def test_oversized_upload_rejected_and_gemini_header_auth(self) -> None:
+        """Oversized >15MB uploads return 413, and GeminiFlashExtractor uses x-goog-api-key header."""
+        from unittest.mock import MagicMock
+        from backend.extraction.gemini import GeminiFlashExtractor
+
+        headers = {"X-FuelV-Key": self.test_write_key}
+        oversized = b"x" * (15 * 1024 * 1024 + 1024)
+        with patch.dict(os.environ, {"FUELV_WRITE_KEY": self.test_write_key, "FUELV_DISABLE_AUTH": "0"}):
+            res = self.client.post(
+                "/api/extract",
+                headers=headers,
+                files={"odo_image": ("huge.jpg", oversized, "image/jpeg")},
+            )
+            self.assertEqual(res.status_code, 413)
+
+        # Gemini API key must be sent in x-goog-api-key header, never in URL query string
+        captured_req = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "candidates": [{"content": {"parts": [{"text": '{"odometer_reading": 100.0, "total_expense": 50.0, "fuel_dispensed": 1.0}'}]}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=30):
+            captured_req["url"] = req.full_url
+            captured_req["headers"] = {k.lower(): v for k, v in req.header_items()}
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ext = GeminiFlashExtractor(api_key="super-secret-gemini-key", model_name="gemini-3.5-flash-lite")
+            out = ext.extract(b"img", "image/jpeg", None, None)
+            self.assertEqual(out["odometer_reading"], 100.0)
+            self.assertNotIn("super-secret-gemini-key", captured_req["url"])
+            self.assertEqual(captured_req["headers"].get("x-goog-api-key"), "super-secret-gemini-key")
+
+    def test_migration_refuses_path_traversal_in_db_path(self) -> None:
+        """Migration script must refuse DB paths attempting directory traversal."""
+        from backend.scripts.migrate_images_to_r2 import migrate_local_images_to_r2
+        from backend.storage.r2 import R2Storage
+
+        self.app.state.repo.insert_snapshot(
+            captured_at="2026-11-12T10:00:00Z",
+            odometer_reading=10000.0,
+            total_expense=100.0,
+            fuel_dispensed=1.0,
+            odo_image_path="../../etc/passwd",
+        )
+        r2 = R2Storage(
+            account_id="acct",
+            access_key_id="key",
+            secret_access_key="secret",
+            bucket_name="public-bucket",
+            key_prefix="fvs",
+            public_base_url="https://r2.pritabrata.com",
+        )
+        summary = migrate_local_images_to_r2(
+            db_path=self.db_path,
+            images_dir=self.img_dir,
+            storage=r2,
+            delete_local=True,
+            dry_run=False,
+        )
+        self.assertEqual(summary["migrated_files"], 0)
+        self.assertTrue(any("traversal" in e.lower() for e in summary["errors"]))
+
 
 class TestDataIntegrityAndEdgeCases(unittest.TestCase):
     """Rigorous Data Integrity, Decimal Precision, and Edge Case Tests."""
 
     def setUp(self) -> None:
+        self.env_patcher = patch.dict(os.environ, {"FUELV_WRITE_KEY": ""})
+        self.env_patcher.start()
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp_dir.name) / "test_data_integrity.db"
         self.repo = SnapshotRepository(db_path=self.db_path)
@@ -293,6 +622,7 @@ class TestDataIntegrityAndEdgeCases(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
+        self.env_patcher.stop()
         self.tmp_dir.cleanup()
 
     # -------------------------------------------------------------------------
@@ -308,6 +638,45 @@ class TestDataIntegrityAndEdgeCases(unittest.TestCase):
         for p in bad_payloads:
             res = self.client.post("/api/snapshots", json=p)
             self.assertEqual(res.status_code, 422, f"Payload {p} should be rejected with 422")
+
+    def test_nan_and_infinity_rejected_by_snapshot_api_and_normalization(self) -> None:
+        """Non-finite floats (inf, -inf, nan) must be rejected so SQLite/JSON never corrupts."""
+        from backend.extraction.base import normalize_extracted_json
+
+        for bad_val in ("inf", "-inf", "nan", "Infinity", "NaN"):
+            res = self.client.post(
+                "/api/snapshots",
+                data={
+                    "odometer_reading": bad_val,
+                    "total_expense": "100.0",
+                    "fuel_dispensed": "2.0",
+                },
+                files={"odo_image": ("empty.jpg", b"", "image/jpeg")},
+            )
+            self.assertEqual(res.status_code, 422, f"Expected 422 for odometer_reading={bad_val!r}")
+
+        snap = self.client.post(
+            "/api/snapshots",
+            json={"odometer_reading": 100.0, "total_expense": 50.0, "fuel_dispensed": 1.0},
+        ).json()
+        res_put = self.client.put(
+            f"/api/snapshots/{snap['id']}",
+            content='{"odometer_reading": Infinity}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res_put.status_code, 422)
+
+        normalized = normalize_extracted_json(
+            {
+                "odometer_reading": float("inf"),
+                "total_expense": float("nan"),
+                "fuel_dispensed": 4.25,
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {"odometer_reading": None, "total_expense": None, "fuel_dispensed": 4.25},
+        )
 
     def test_zero_fuel_and_zero_expense_handled_gracefully(self) -> None:
         """Zero fuel dispensed must not trigger division by zero in efficiency calculations."""

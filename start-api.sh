@@ -17,5 +17,8 @@ if ! python3 -c "import uvicorn, fastapi, multipart" >/dev/null 2>&1; then
 fi
 
 PORT="${PORT:-8000}"
+echo "Running pre-flight configuration validation..."
+python3 -m backend.config
+
 echo "Starting FuelV API server on http://127.0.0.1:${PORT} (Docs: http://127.0.0.1:${PORT}/docs)..."
 exec uvicorn backend.main:app --reload --port "${PORT}"

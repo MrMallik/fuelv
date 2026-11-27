@@ -94,7 +94,16 @@ async function save() {
       }
     }
 
-    const isoTime = capturedAt.value ? new Date(capturedAt.value).toISOString() : props.log.captured_at
+    let isoTime = props.log.captured_at
+    if (capturedAt.value) {
+      const parsedDate = new Date(capturedAt.value)
+      if (isNaN(parsedDate.getTime())) {
+        error.value = 'Please enter a valid date and time.'
+        saving.value = false
+        return
+      }
+      isoTime = parsedDate.toISOString()
+    }
 
     const updated = await updateSnapshot(props.log.id, {
       odometer_reading: odoVal,

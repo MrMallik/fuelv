@@ -23,9 +23,24 @@ A lightweight, extensible fullstack fuel logging web app built with a **Vue 3 (V
 
 ## Quick Start
 
+### Using Mise (Recommended)
+This repository uses [`mise`](https://mise.jdx.dev) to manage Python 3.12, Node 22, and tasks:
+
+```bash
+# 1. Copy environment template and configure secrets
+cp .env.example .env
+
+# 2. Install runtimes & dependencies
+mise run setup
+
+# 3. Start both backend (:8000) and frontend (:5173)
+mise run dev
+```
+
+### Standard Setup (Without Mise)
 ```bash
 cp .env.example .env
-# Edit .env and set GEMINI_API_KEY=your_key_here
+# Edit .env and set GEMINI_API_KEY, R2 credentials, FUELV_WRITE_KEY
 
 # Start both backend (:8000) and frontend (:5173)
 ./dev.sh
@@ -37,7 +52,12 @@ Or run them separately:
 
 ---
 
-## Running Backend Unit Tests
+## Testing
+
 ```bash
-python3 -m unittest discover -s backend/tests -p "test_*.py" -v
+# Run all tests (backend + frontend) with mise
+mise run test
+
+# Or using Python directly:
+.venv/bin/python3 -m unittest discover -s backend/tests -p "test_*.py" -v
 ```

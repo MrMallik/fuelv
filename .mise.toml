@@ -1,0 +1,52 @@
+[tools]
+python = "3.12"
+node = "22"
+
+[env]
+# Automatically activates the Python virtual environment
+_.python.venv = ".venv"
+# Automatically loads variables from .env
+_.file = ".env"
+
+[tasks.setup]
+description = "Install all dependencies for backend (Python) and frontend (Node)"
+run = """
+python3 -m pip install -r backend/requirements.txt
+cd frontend && npm install
+"""
+
+[tasks."test:backend"]
+description = "Run all 82 backend feature, regression, and security tests"
+run = "python3 -W ignore::DeprecationWarning -m unittest discover -s backend/tests -p 'test_*.py' -v"
+
+[tasks."test:feature"]
+description = "Run feature specification tests (CRUD, VLM contract, timeline grouping, metadata)"
+run = "python3 -W ignore::DeprecationWarning -m unittest discover -s backend/tests/feature -p 'test_*.py' -v"
+
+[tasks."test:regression"]
+description = "Run regression tests (chronological chain, R2 storage, WAL concurrency, timing-safe auth)"
+run = "python3 -W ignore::DeprecationWarning -m unittest discover -s backend/tests/regression -p 'test_*.py' -v"
+
+[tasks."test:frontend"]
+description = "Typecheck and build Vue 3 production bundle"
+dir = "frontend"
+run = "npm run build"
+
+[tasks.test]
+description = "Run full test verification across backend and frontend"
+depends = ["test:backend", "test:frontend"]
+
+[tasks.dev]
+description = "Launch FastAPI (:8000) and Vite (:5173) simultaneously"
+run = "./dev.sh"
+
+[tasks.api]
+description = "Start backend FastAPI server (:8000) with hot-reload"
+run = "./start-api.sh"
+
+[tasks.lint]
+description = "Validate shell script syntax and TypeScript types"
+run = """
+bash -n deploy-scripts/*.sh scripts/*.sh start-api.sh dev.sh
+cd frontend && npx vue-tsc --noEmit
+"""

@@ -84,6 +84,11 @@ export interface HealthStatus {
   extractor_model: string
   gemini_key_configured: boolean
   write_protection_enabled?: boolean
+  storage_backend?: string
+  r2_configured?: boolean
+  r2_bucket?: string
+  r2_prefix?: string
+  r2_public_base_url?: string
 }
 
 const STORAGE_WRITE_KEY = 'fuelv_write_key'
@@ -124,8 +129,62 @@ export function resolveApiUrl(path: string | null): string | null {
   return `${API_BASE}${path.startsWith('/') ? '' : '/'}${path}`
 }
 
+function extractErrorMessage(errBody: unknown, fallback: string): string {
+  if (!errBody || typeof errBody !== 'object') return fallback
+  const detail = (errBody as { detail?: unknown }).detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail) && detail.length > 0) {
+    const msgs = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object' && 'msg' in item) {
+          return String((item as { msg: unknown }).msg)
+        }
+        return JSON.stringify(item)
+      })
+      .filter(Boolean)
+    if (msgs.length > 0) return msgs.join('; ')
+  }
+  return fallback
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 15000,
+  retries = 0
+): Promise<Response> {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      if (res.status >= 502 && res.status <= 504 && attempt < retries) {
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)))
+        continue
+      }
+      return res
+    } catch (err: unknown) {
+      clearTimeout(timer)
+      lastError = err
+      if ((err as Error)?.name === 'AbortError') {
+        lastError = new Error('Request timed out — please check your network connection.')
+      }
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)))
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Network request failed')
+}
+
 export async function fetchHealth(): Promise<HealthStatus> {
-  const res = await fetch(`${API_BASE}/api/health`)
+  const res = await fetchWithTimeout(`${API_BASE}/api/health`, {}, 10000, 1)
   if (!res.ok) {
     throw new Error(`Health check failed (${res.status})`)
   }
@@ -141,15 +200,20 @@ export async function extractFromImages(
   if (pumpFile) formData.append('pump_image', pumpFile)
 
   const headers = getWriteHeaders()
-  const res = await fetch(`${API_BASE}/api/extract`, {
-    method: 'POST',
-    headers,
-    body: formData,
-  })
+  const res = await fetchWithTimeout(
+    `${API_BASE}/api/extract`,
+    {
+      method: 'POST',
+      headers,
+      body: formData,
+    },
+    30000,
+    1
+  )
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    const err = new Error(errBody.detail || `Extraction failed (${res.status})`)
+    const err = new Error(extractErrorMessage(errBody, `Extraction failed (${res.status})`))
     if (res.status === 401) {
       ;(err as any).isAuthError = true
     }
@@ -158,17 +222,58 @@ export async function extractFromImages(
   return res.json()
 }
 
-export async function createSnapshot(payload: CreateSnapshotPayload): Promise<FuelSnapshot> {
-  const headers = getWriteHeaders({ 'Content-Type': 'application/json' })
-  const res = await fetch(`${API_BASE}/api/snapshots`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  })
+export async function createSnapshot(
+  payload: CreateSnapshotPayload,
+  odoFile?: File | null,
+  pumpFile?: File | null
+): Promise<FuelSnapshot> {
+  let res: Response
+
+  if (odoFile || pumpFile) {
+    const formData = new FormData()
+    if (payload.captured_at) formData.append('captured_at', payload.captured_at)
+    formData.append('odometer_reading', String(payload.odometer_reading))
+    formData.append('total_expense', String(payload.total_expense))
+    formData.append('fuel_dispensed', String(payload.fuel_dispensed))
+    if (payload.entry_mode) formData.append('entry_mode', payload.entry_mode)
+    if (payload.extractor_model) formData.append('extractor_model', payload.extractor_model)
+    if (payload.raw_extraction_json) {
+      formData.append('raw_extraction_json', JSON.stringify(payload.raw_extraction_json))
+    }
+    if (payload.extra_data) {
+      formData.append('extra_data', JSON.stringify(payload.extra_data))
+    }
+    if (odoFile) formData.append('odo_image', odoFile)
+    if (pumpFile) formData.append('pump_image', pumpFile)
+
+    const headers = getWriteHeaders()
+    res = await fetchWithTimeout(
+      `${API_BASE}/api/snapshots`,
+      {
+        method: 'POST',
+        headers,
+        body: formData,
+      },
+      30000,
+      0
+    )
+  } else {
+    const headers = getWriteHeaders({ 'Content-Type': 'application/json' })
+    res = await fetchWithTimeout(
+      `${API_BASE}/api/snapshots`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      },
+      15000,
+      0
+    )
+  }
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    const err = new Error(errBody.detail || `Failed to save snapshot (${res.status})`)
+    const err = new Error(extractErrorMessage(errBody, `Failed to save fuel log (${res.status})`))
     if (res.status === 401) {
       ;(err as any).isAuthError = true
     }
@@ -180,22 +285,32 @@ export async function createSnapshot(payload: CreateSnapshotPayload): Promise<Fu
 export async function fetchGroupedSnapshots(
   by: GroupByPeriod = 'month'
 ): Promise<GroupedSnapshotsResponse> {
-  const res = await fetch(`${API_BASE}/api/snapshots/grouped?by=${encodeURIComponent(by)}`)
+  const res = await fetchWithTimeout(
+    `${API_BASE}/api/snapshots/grouped?by=${encodeURIComponent(by)}`,
+    {},
+    15000,
+    2
+  )
   if (!res.ok) {
-    throw new Error(`Failed to fetch snapshots (${res.status})`)
+    throw new Error(`Failed to fetch fuel logs (${res.status})`)
   }
   return res.json()
 }
 
 export async function deleteSnapshot(id: string): Promise<void> {
   const headers = getWriteHeaders()
-  const res = await fetch(`${API_BASE}/api/snapshots/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-    headers,
-  })
+  const res = await fetchWithTimeout(
+    `${API_BASE}/api/snapshots/${encodeURIComponent(id)}`,
+    {
+      method: 'DELETE',
+      headers,
+    },
+    15000,
+    0
+  )
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    const err = new Error(errBody.detail || `Failed to delete snapshot (${res.status})`)
+    const err = new Error(extractErrorMessage(errBody, `Failed to delete snapshot (${res.status})`))
     if (res.status === 401) {
       ;(err as any).isAuthError = true
     }
@@ -217,15 +332,20 @@ export async function updateSnapshot(
   payload: UpdateSnapshotPayload
 ): Promise<FuelSnapshot> {
   const headers = getWriteHeaders({ 'Content-Type': 'application/json' })
-  const res = await fetch(`${API_BASE}/api/snapshots/${encodeURIComponent(id)}`, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify(payload),
-  })
+  const res = await fetchWithTimeout(
+    `${API_BASE}/api/snapshots/${encodeURIComponent(id)}`,
+    {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    15000,
+    0
+  )
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}))
-    const err = new Error(errBody.detail || `Failed to update snapshot (${res.status})`)
+    const err = new Error(extractErrorMessage(errBody, `Failed to update snapshot (${res.status})`))
     if (res.status === 401) {
       ;(err as any).isAuthError = true
     }
@@ -235,7 +355,7 @@ export async function updateSnapshot(
 }
 
 export async function fetchLatestSnapshot(): Promise<FuelSnapshot | null> {
-  const res = await fetch(`${API_BASE}/api/snapshots/latest`)
+  const res = await fetchWithTimeout(`${API_BASE}/api/snapshots/latest`, {}, 10000, 1)
   if (!res.ok) return null
   const data = await res.json()
   return data.latest || null

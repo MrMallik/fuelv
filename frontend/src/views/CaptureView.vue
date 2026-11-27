@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, watch } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import CameraModal from '../components/CameraModal.vue'
 import KeySettingsModal from '../components/KeySettingsModal.vue'
@@ -12,40 +12,48 @@ import {
   fetchLatestSnapshot,
   type ExtractedFuelData,
 } from '../services/api'
+import {
+  blobToFile,
+  clearDraftState,
+  loadDraftState,
+  saveDraftState,
+} from '../services/draftStorage'
+import { optimizeSnapshotImage } from '../services/imageOptimizer'
 
 const router = useRouter()
 
 // Image state
 const odoFile = ref<File | null>(null)
 const odoPreview = ref<string | null>(null)
+const odoOptimizing = ref(false)
+
 const pumpFile = ref<File | null>(null)
 const pumpPreview = ref<string | null>(null)
+const pumpOptimizing = ref(false)
+
+// Lightbox preview for inspecting digits on Step 1 or Step 2
+const previewLightbox = ref<{ url: string; title: string } | null>(null)
 
 // Camera modal state ('odo' | 'pump' | null)
 const activeCameraTarget = ref<'odo' | 'pump' | null>(null)
 const showKeyModal = ref(false)
+
+// Draft persistence state
+const isHydratingDraft = ref(true)
+const draftRestored = ref(false)
+const lastSavedLocallyAt = ref<string | null>(null)
+let isUnmounted = false
+let odoGeneration = 0
+let pumpGeneration = 0
 
 // Extraction state
 const extracting = ref(false)
 const extractionWarning = ref<string | null>(null)
 const extractorModel = ref<string | null>(null)
 const rawExtractionJson = ref<ExtractedFuelData | null>(null)
-const savedOdoPath = ref<string | null>(null)
-const savedPumpPath = ref<string | null>(null)
 
 // Previous odometer reading for telemetry efficiency
 const previousOdometer = ref<number | null>(null)
-
-onMounted(async () => {
-  try {
-    const latest = await fetchLatestSnapshot()
-    if (latest && latest.odometer_reading != null) {
-      previousOdometer.value = latest.odometer_reading
-    }
-  } catch {
-    // Graceful fallback: non-blocking
-  }
-})
 
 // Form state
 const step = ref<'capture' | 'confirm'>('capture')
@@ -53,6 +61,30 @@ const odometerReading = ref<string>('')
 const totalExpense = ref<string>('')
 const fuelDispensed = ref<string>('')
 const capturedAt = ref<string>(toLocalDatetimeInput(new Date()))
+
+// Optional extensible extra_data fields
+const showExtra = ref(false)
+const vehicleTag = ref<string>('My Bike')
+const stationName = ref<string>('')
+const notes = ref<string>('')
+
+const saving = ref(false)
+const saveError = ref<string | null>(null)
+
+function toLocalDatetimeInput(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function revokeObjectUrl(url: string | null) {
+  if (url && url.startsWith('blob:')) {
+    try {
+      URL.revokeObjectURL(url)
+    } catch {
+      // Ignore revoke errors
+    }
+  }
+}
 
 // Real-time computed fuel efficiency (km/L)
 const liveEfficiency = computed(() => {
@@ -91,38 +123,148 @@ const liveEfficiency = computed(() => {
   }
 })
 
-// Optional extensible extra_data fields
-const showExtra = ref(false)
-const vehicleTag = ref<string>('My Bike')
-const stationName = ref<string>('')
-const notes = ref<string>('')
+const hasAnyImage = computed(() => Boolean(odoFile.value || pumpFile.value))
 
-const saving = ref(false)
-const saveError = ref<string | null>(null)
+const hasActiveLocalDraft = computed(() =>
+  Boolean(
+    odoFile.value ||
+      pumpFile.value ||
+      odometerReading.value.trim() ||
+      totalExpense.value.trim() ||
+      fuelDispensed.value.trim()
+  )
+)
 
-function toLocalDatetimeInput(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+async function persistFormFieldsToDraft() {
+  if (isHydratingDraft.value || isUnmounted) return
+  const rawExtraction = rawExtractionJson.value ? { ...toRaw(rawExtractionJson.value) } : null
+  await saveDraftState({
+    step: step.value,
+    odometerReading: odometerReading.value,
+    totalExpense: totalExpense.value,
+    fuelDispensed: fuelDispensed.value,
+    capturedAt: capturedAt.value,
+    extractorModel: extractorModel.value,
+    rawExtractionJson: rawExtraction,
+    extractionWarning: extractionWarning.value,
+    vehicleTag: vehicleTag.value,
+    stationName: stationName.value,
+    notes: notes.value,
+    showExtra: showExtra.value,
+  })
+  if (!isUnmounted) {
+    lastSavedLocallyAt.value = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+}
+
+watch(
+  [
+    step,
+    odometerReading,
+    totalExpense,
+    fuelDispensed,
+    capturedAt,
+    extractorModel,
+    rawExtractionJson,
+    extractionWarning,
+    vehicleTag,
+    stationName,
+    notes,
+    showExtra,
+  ],
+  () => {
+    persistFormFieldsToDraft()
+  }
+)
+
+async function applyImageToSlot(slot: 'odo' | 'pump', file: File | null) {
+  const isOdo = slot === 'odo'
+  const gen = isOdo ? ++odoGeneration : ++pumpGeneration
+  const fileRef = isOdo ? odoFile : pumpFile
+  const previewRef = isOdo ? odoPreview : pumpPreview
+  const optimizingRef = isOdo ? odoOptimizing : pumpOptimizing
+  const currentGen = () => (isOdo ? odoGeneration : pumpGeneration)
+
+  const buildDraftPatch = (blob: File | null, name: string | null, type: string | null) =>
+    isOdo
+      ? { odoBlob: blob, odoName: name, odoType: type }
+      : { pumpBlob: blob, pumpName: name, pumpType: type }
+
+  revokeObjectUrl(previewRef.value)
+  if (!file) {
+    fileRef.value = null
+    previewRef.value = null
+    optimizingRef.value = false
+    await saveDraftState(buildDraftPatch(null, null, null))
+    return
+  }
+
+  // 1. Immediately display and persist raw photo to IndexedDB so a tab reload can never lose it
+  const rawPreviewUrl = URL.createObjectURL(file)
+  if (isUnmounted) {
+    revokeObjectUrl(rawPreviewUrl)
+    return
+  }
+  fileRef.value = file
+  previewRef.value = rawPreviewUrl
+
+  await saveDraftState(
+    buildDraftPatch(
+      file,
+      file.name || `${slot}_${Date.now()}.jpg`,
+      file.type || 'image/jpeg'
+    )
+  )
+  if (isUnmounted || gen !== currentGen()) {
+    return
+  }
+  lastSavedLocallyAt.value = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+  // 2. Optimize image size in background for fast 4G/5G extraction & R2 upload
+  optimizingRef.value = true
+  try {
+    const optimized = await optimizeSnapshotImage(file, slot)
+    if (isUnmounted || gen !== currentGen()) {
+      return
+    }
+    if (optimized !== file) {
+      const oldUrl = previewRef.value
+      const newUrl = URL.createObjectURL(optimized)
+      fileRef.value = optimized
+      previewRef.value = newUrl
+      if (previewLightbox.value && previewLightbox.value.url === oldUrl) {
+        previewLightbox.value = { ...previewLightbox.value, url: newUrl }
+      }
+      revokeObjectUrl(oldUrl)
+      await saveDraftState(buildDraftPatch(optimized, optimized.name, optimized.type))
+    }
+  } finally {
+    if (gen === currentGen()) {
+      optimizingRef.value = false
+    }
+  }
 }
 
 function setOdoFile(file: File | null) {
-  odoFile.value = file
-  odoPreview.value = file ? URL.createObjectURL(file) : null
+  return applyImageToSlot('odo', file)
 }
 
 function setPumpFile(file: File | null) {
-  pumpFile.value = file
-  pumpPreview.value = file ? URL.createObjectURL(file) : null
+  return applyImageToSlot('pump', file)
 }
 
 function onOdoFileChange(e: Event) {
   const input = e.target as HTMLInputElement
-  setOdoFile(input.files?.[0] || null)
+  const f = input.files?.[0] || null
+  if (f) setOdoFile(f)
+  input.value = ''
 }
 
 function onPumpFileChange(e: Event) {
   const input = e.target as HTMLInputElement
-  setPumpFile(input.files?.[0] || null)
+  const f = input.files?.[0] || null
+  if (f) setPumpFile(f)
+  input.value = ''
 }
 
 function onCameraCaptured(file: File) {
@@ -134,7 +276,131 @@ function onCameraCaptured(file: File) {
   activeCameraTarget.value = null
 }
 
-const hasAnyImage = computed(() => Boolean(odoFile.value || pumpFile.value))
+async function discardDraft() {
+  isHydratingDraft.value = true
+  odoGeneration++
+  pumpGeneration++
+  odoOptimizing.value = false
+  pumpOptimizing.value = false
+  previewLightbox.value = null
+  revokeObjectUrl(odoPreview.value)
+  revokeObjectUrl(pumpPreview.value)
+  odoFile.value = null
+  odoPreview.value = null
+  pumpFile.value = null
+  pumpPreview.value = null
+  step.value = 'capture'
+  odometerReading.value = ''
+  totalExpense.value = ''
+  fuelDispensed.value = ''
+  capturedAt.value = toLocalDatetimeInput(new Date())
+  rawExtractionJson.value = null
+  extractorModel.value = null
+  extractionWarning.value = null
+  saveError.value = null
+  stationName.value = ''
+  notes.value = ''
+  draftRestored.value = false
+  lastSavedLocallyAt.value = null
+  try {
+    await nextTick()
+    await clearDraftState()
+  } finally {
+    isHydratingDraft.value = false
+  }
+}
+
+onMounted(async () => {
+  window.addEventListener('keydown', onWindowKeydown)
+
+  // 1. Restore any existing draft from IndexedDB across browser refreshes
+  try {
+    const draft = await loadDraftState()
+    if (isUnmounted) return
+    if (draft) {
+      let restoredSomething = false
+      if (draft.odoBlob) {
+        const f = blobToFile(draft.odoBlob, draft.odoName || 'odo_restored.jpg', draft.odoType)
+        odoFile.value = f
+        odoPreview.value = URL.createObjectURL(f)
+        restoredSomething = true
+      }
+      if (draft.pumpBlob) {
+        const f = blobToFile(draft.pumpBlob, draft.pumpName || 'pump_restored.jpg', draft.pumpType)
+        pumpFile.value = f
+        pumpPreview.value = URL.createObjectURL(f)
+        restoredSomething = true
+      }
+      if (draft.odometerReading) {
+        odometerReading.value = draft.odometerReading
+        restoredSomething = true
+      }
+      if (draft.totalExpense) {
+        totalExpense.value = draft.totalExpense
+        restoredSomething = true
+      }
+      if (draft.fuelDispensed) {
+        fuelDispensed.value = draft.fuelDispensed
+        restoredSomething = true
+      }
+      if (draft.capturedAt) {
+        capturedAt.value = draft.capturedAt
+      }
+      if (draft.rawExtractionJson) {
+        rawExtractionJson.value = draft.rawExtractionJson
+      }
+      if (draft.extractorModel) {
+        extractorModel.value = draft.extractorModel
+      }
+      if (draft.extractionWarning) {
+        extractionWarning.value = draft.extractionWarning
+      }
+      if (draft.vehicleTag) {
+        vehicleTag.value = draft.vehicleTag
+      }
+      if (draft.stationName) {
+        stationName.value = draft.stationName
+      }
+      if (draft.notes) {
+        notes.value = draft.notes
+      }
+      showExtra.value = Boolean(draft.showExtra)
+      if (restoredSomething) {
+        step.value = draft.step || 'capture'
+        draftRestored.value = true
+      }
+    }
+    await nextTick()
+  } finally {
+    isHydratingDraft.value = false
+  }
+
+  // 2. Fetch latest snapshot for live km/L efficiency calculation
+  try {
+    const latest = await fetchLatestSnapshot()
+    if (!isUnmounted && latest && latest.odometer_reading != null) {
+      previousOdometer.value = latest.odometer_reading
+    }
+  } catch {
+    // Non-blocking
+  }
+})
+
+function onWindowKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    previewLightbox.value = null
+    activeCameraTarget.value = null
+  }
+}
+
+onBeforeUnmount(() => {
+  isUnmounted = true
+  odoGeneration++
+  pumpGeneration++
+  window.removeEventListener('keydown', onWindowKeydown)
+  revokeObjectUrl(odoPreview.value)
+  revokeObjectUrl(pumpPreview.value)
+})
 
 async function runExtraction() {
   if (!hasAnyImage.value) return
@@ -143,10 +409,9 @@ async function runExtraction() {
 
   try {
     const res = await extractFromImages(odoFile.value, pumpFile.value)
+    if (isUnmounted) return
     rawExtractionJson.value = res.extraction
     extractorModel.value = res.meta.extractor_model
-    savedOdoPath.value = res.meta.odo_image_path
-    savedPumpPath.value = res.meta.pump_image_path
     extractionWarning.value = res.meta.warning
 
     if (res.efficiency?.previous_odometer != null) {
@@ -164,17 +429,22 @@ async function runExtraction() {
     }
 
     step.value = 'confirm'
+    await persistFormFieldsToDraft()
   } catch (err: unknown) {
+    if (isUnmounted) return
     if ((err as any)?.isAuthError) {
       showKeyModal.value = true
     }
     extractionWarning.value =
       err instanceof Error
-        ? `${err.message}. Switched to manual fallback.`
-        : 'Extraction failed. Switched to manual fallback.'
+        ? `${err.message}. Switched to manual fallback — your photos remain saved on your device.`
+        : 'Extraction failed. Switched to manual fallback — your photos remain saved on your device.'
     step.value = 'confirm'
+    await persistFormFieldsToDraft()
   } finally {
-    extracting.value = false
+    if (!isUnmounted) {
+      extracting.value = false
+    }
   }
 }
 
@@ -182,6 +452,14 @@ function skipToManual() {
   rawExtractionJson.value = null
   extractionWarning.value = null
   step.value = 'confirm'
+}
+
+function formatFileSize(bytes: number | undefined): string {
+  if (!bytes) return ''
+  if (bytes < 1024) return `${bytes} B`
+  const kb = Math.round(bytes / 1024)
+  if (kb < 1024) return `${kb} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 async function submitSnapshot() {
@@ -218,28 +496,43 @@ async function submitSnapshot() {
       extra.previous_odometer = liveEfficiency.value.previousOdometer
     }
 
-    const isoTime = capturedAt.value
-      ? new Date(capturedAt.value).toISOString()
-      : new Date().toISOString()
+    const parsedDate = capturedAt.value ? new Date(capturedAt.value) : new Date()
+    if (isNaN(parsedDate.getTime())) {
+      saveError.value = 'Please enter a valid date and time.'
+      return
+    }
+    const isoTime = parsedDate.toISOString()
 
-    await createSnapshot({
-      captured_at: isoTime,
-      odometer_reading: odoVal,
-      total_expense: expVal,
-      fuel_dispensed: fuelVal,
-      odo_image_path: savedOdoPath.value,
-      pump_image_path: savedPumpPath.value,
-      extractor_model: extractorModel.value,
-      raw_extraction_json: rawExtractionJson.value,
-      extra_data: extra,
-    })
+    // Upload retained client images to Cloudflare R2 (public-bucket/fvs/) and persist log atomically
+    await createSnapshot(
+      {
+        captured_at: isoTime,
+        odometer_reading: odoVal,
+        total_expense: expVal,
+        fuel_dispensed: fuelVal,
+        extractor_model: extractorModel.value,
+        raw_extraction_json: rawExtractionJson.value ? { ...toRaw(rawExtractionJson.value) } : null,
+        extra_data: extra,
+      },
+      odoFile.value,
+      pumpFile.value
+    )
 
+    // Prevent in-flight background optimization or watchers from recreating the draft after submit
+    isHydratingDraft.value = true
+    odoGeneration++
+    pumpGeneration++
+    // Clear client IndexedDB draft ONLY after R2 upload + SQLite commit succeeds
+    await clearDraftState()
     router.push('/')
   } catch (err: unknown) {
     if ((err as any)?.isAuthError) {
       showKeyModal.value = true
     }
-    saveError.value = err instanceof Error ? err.message : 'Failed to save fuel log'
+    saveError.value =
+      err instanceof Error
+        ? `${err.message} (Your photos & numbers remain safely saved on this device.)`
+        : 'Failed to save fuel log. Your photos & numbers remain safely saved on this device.'
   } finally {
     saving.value = false
   }
@@ -248,12 +541,27 @@ async function submitSnapshot() {
 
 <template>
   <section>
-    <div style="margin-bottom: 1rem">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 1rem">
       <RouterLink to="/" class="text-link" style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8125rem">
         <!-- Arrow Left -->
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
-        Back to Fuel Logs
+        Back to Dashboard
       </RouterLink>
+
+      <!-- Device Draft Retention Pill -->
+      <div
+        v-if="hasActiveLocalDraft"
+        style="display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); padding: 0.25rem 0.65rem; border-radius: 9999px"
+      >
+        <span>✓ {{ draftRestored ? 'Draft restored from device' : 'Saved on device (safe across refreshes)' }}</span>
+        <button
+          type="button"
+          style="background: none; border: none; color: var(--muted-foreground); font-size: 0.75rem; text-decoration: underline; cursor: pointer; padding: 0 0 0 0.25rem"
+          @click="discardDraft"
+        >
+          Clear draft
+        </button>
+      </div>
     </div>
 
     <header class="page-header">
@@ -262,7 +570,7 @@ async function submitSnapshot() {
         <div>
           <h1 class="page-title">Log Fuel</h1>
           <p class="page-description">
-            Capture or upload odometer and pump display photos for instant AI extraction.
+            Capture odometer and pump photos. Stored safely on your device until you confirm and save.
           </p>
         </div>
 
@@ -293,9 +601,19 @@ async function submitSnapshot() {
         <!-- Slot 1: Odometer -->
         <div class="upload-slot" :class="{ 'has-file': odoPreview }" style="cursor: default">
           <template v-if="odoPreview">
-            <img :src="odoPreview" alt="Odometer preview" class="upload-preview" />
-            <span style="font-size: 0.75rem; color: var(--muted-foreground)">
-              1. Odometer photo attached
+            <img
+              :src="odoPreview"
+              alt="Odometer preview"
+              class="upload-preview"
+              style="cursor: zoom-in"
+              title="Tap to enlarge odometer photo"
+              @click="previewLightbox = { url: odoPreview, title: 'Odometer Photo (Stored on Device)' }"
+            />
+            <span style="font-size: 0.75rem; color: #10b981; font-weight: 500">
+              ✓ 1. Odometer saved on device
+              <span v-if="odoFile" style="color: var(--muted-foreground); font-weight: 400">
+                ({{ odoOptimizing ? 'optimizing…' : formatFileSize(odoFile.size) }})
+              </span>
             </span>
           </template>
           <template v-else>
@@ -307,7 +625,21 @@ async function submitSnapshot() {
           </template>
 
           <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.5rem; margin-top: 0.75rem">
-            <!-- Mode 1: Select from files -->
+            <!-- Primary Action: One-Tap Native 1.0x Camera (Fixes Samsung 0.6x WebRTC lens selection) -->
+            <label class="ui-btn ui-btn-default ui-btn-sm" style="cursor: pointer">
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                class="sr-only"
+                @change="onOdoFileChange"
+              />
+              <!-- Camera icon -->
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+              {{ odoPreview ? 'Retake photo' : 'Take photo' }}
+            </label>
+
+            <!-- Mode 2: Select from gallery / files -->
             <label class="ui-btn ui-btn-outline ui-btn-sm" style="cursor: pointer">
               <input
                 type="file"
@@ -317,18 +649,16 @@ async function submitSnapshot() {
               />
               <!-- Upload icon -->
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-              Select file
+              Gallery
             </label>
 
-            <!-- Mode 2: Capture using camera -->
+            <!-- Mode 3: In-browser 1.0x WebRTC viewfinder modal -->
             <UiButton
               variant="secondary"
               size="sm"
               @click="activeCameraTarget = 'odo'"
             >
-              <!-- Camera icon -->
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
-              Use camera
+              Web Cam
             </UiButton>
 
             <UiButton
@@ -345,9 +675,19 @@ async function submitSnapshot() {
         <!-- Slot 2: Fuel Pump -->
         <div class="upload-slot" :class="{ 'has-file': pumpPreview }" style="cursor: default">
           <template v-if="pumpPreview">
-            <img :src="pumpPreview" alt="Fuel pump preview" class="upload-preview" />
-            <span style="font-size: 0.75rem; color: var(--muted-foreground)">
-              2. Fuel pump photo attached
+            <img
+              :src="pumpPreview"
+              alt="Fuel pump preview"
+              class="upload-preview"
+              style="cursor: zoom-in"
+              title="Tap to enlarge fuel pump photo"
+              @click="previewLightbox = { url: pumpPreview, title: 'Fuel Pump Photo (Stored on Device)' }"
+            />
+            <span style="font-size: 0.75rem; color: #10b981; font-weight: 500">
+              ✓ 2. Fuel pump saved on device
+              <span v-if="pumpFile" style="color: var(--muted-foreground); font-weight: 400">
+                ({{ pumpOptimizing ? 'optimizing…' : formatFileSize(pumpFile.size) }})
+              </span>
             </span>
           </template>
           <template v-else>
@@ -359,7 +699,21 @@ async function submitSnapshot() {
           </template>
 
           <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.5rem; margin-top: 0.75rem">
-            <!-- Mode 1: Select from files -->
+            <!-- Primary Action: One-Tap Native 1.0x Camera -->
+            <label class="ui-btn ui-btn-default ui-btn-sm" style="cursor: pointer">
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                class="sr-only"
+                @change="onPumpFileChange"
+              />
+              <!-- Camera icon -->
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+              {{ pumpPreview ? 'Retake photo' : 'Take photo' }}
+            </label>
+
+            <!-- Mode 2: Select from gallery / files -->
             <label class="ui-btn ui-btn-outline ui-btn-sm" style="cursor: pointer">
               <input
                 type="file"
@@ -369,18 +723,16 @@ async function submitSnapshot() {
               />
               <!-- Upload icon -->
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-              Select file
+              Gallery
             </label>
 
-            <!-- Mode 2: Capture using camera -->
+            <!-- Mode 3: In-browser 1.0x WebRTC viewfinder modal -->
             <UiButton
               variant="secondary"
               size="sm"
               @click="activeCameraTarget = 'pump'"
             >
-              <!-- Camera icon -->
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
-              Use camera
+              Web Cam
             </UiButton>
 
             <UiButton
@@ -402,10 +754,10 @@ async function submitSnapshot() {
 
         <UiButton
           variant="default"
-          :disabled="!hasAnyImage || extracting"
+          :disabled="!hasAnyImage || extracting || odoOptimizing || pumpOptimizing"
           @click="runExtraction"
         >
-          <span v-if="extracting">Extracting JSON…</span>
+          <span v-if="extracting">Analyzing photos with AI…</span>
           <span v-else>Extract from photos</span>
         </UiButton>
       </div>
@@ -413,18 +765,43 @@ async function submitSnapshot() {
 
     <!-- STEP 2: Review Extracted JSON / Manual Fallback Form -->
     <form v-else @submit.prevent="submitSnapshot">
-      <div v-if="odoPreview || pumpPreview" style="display: flex; align-items: center; gap: 1rem; padding-bottom: 1.25rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border)">
-        <div v-if="odoPreview" class="thumb-card" style="cursor: default">
+      <div v-if="odoPreview || pumpPreview" style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.85rem; padding-bottom: 1.25rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border)">
+        <button
+          v-if="odoPreview"
+          type="button"
+          class="thumb-card"
+          title="Tap to inspect odometer photo"
+          @click="previewLightbox = { url: odoPreview, title: 'Odometer Photo (Tap to verify digits)' }"
+        >
           <img :src="odoPreview" alt="Odometer" />
-          <span>Odo</span>
-        </div>
-        <div v-if="pumpPreview" class="thumb-card" style="cursor: default">
+          <span>Odo (Zoom)</span>
+        </button>
+        <button
+          v-if="pumpPreview"
+          type="button"
+          class="thumb-card"
+          title="Tap to inspect fuel pump photo"
+          @click="previewLightbox = { url: pumpPreview, title: 'Fuel Pump Photo (Tap to verify digits)' }"
+        >
           <img :src="pumpPreview" alt="Fuel Pump" />
-          <span>Pump</span>
+          <span>Pump (Zoom)</span>
+        </button>
+
+        <div style="display: flex; align-items: center; gap: 0.5rem">
+          <UiButton variant="outline" size="sm" type="button" @click="step = 'capture'">
+            Change photos
+          </UiButton>
+          <UiButton
+            v-if="hasAnyImage"
+            variant="secondary"
+            size="sm"
+            type="button"
+            :disabled="extracting || odoOptimizing || pumpOptimizing"
+            @click="runExtraction"
+          >
+            {{ extracting ? 'Re-extracting…' : 'Re-run AI extraction' }}
+          </UiButton>
         </div>
-        <UiButton variant="ghost" size="sm" @click="step = 'capture'">
-          Change photos
-        </UiButton>
       </div>
 
       <div v-if="extractionWarning" class="notice-banner">
@@ -550,25 +927,38 @@ async function submitSnapshot() {
         </div>
       </div>
 
-      <div v-if="saveError" class="notice-banner">
+      <div v-if="saveError" class="notice-banner" style="border-color: #ef4444; color: #ef4444">
         {{ saveError }}
       </div>
 
       <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding-top: 1rem; border-top: 1px solid var(--border)">
-        <UiButton variant="outline" @click="step = 'capture'">
-          Back
+        <UiButton variant="outline" type="button" @click="step = 'capture'">
+          Back to photos
         </UiButton>
 
         <UiButton type="submit" variant="default" :disabled="saving">
-          {{ saving ? 'Saving…' : 'Save fuel log' }}
+          {{ saving ? 'Uploading to R2 & saving…' : 'Save fuel log' }}
         </UiButton>
       </div>
     </form>
 
+    <!-- Full-Screen Photo Lightbox for Digit Inspection -->
+    <div v-if="previewLightbox" class="dialog-overlay" @click="previewLightbox = null">
+      <div class="dialog-content" @click.stop>
+        <header class="dialog-header">
+          <span>{{ previewLightbox.title }}</span>
+          <UiButton variant="ghost" size="icon" @click="previewLightbox = null">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </UiButton>
+        </header>
+        <img :src="previewLightbox.url" :alt="previewLightbox.title" class="dialog-img" />
+      </div>
+    </div>
+
     <!-- Live Camera Capture Modal -->
     <CameraModal
       v-if="activeCameraTarget"
-      :title="activeCameraTarget === 'odo' ? 'Capture Odometer Photo' : 'Capture Fuel Pump Display'"
+      :title="activeCameraTarget === 'odo' ? 'Capture Odometer Photo (1.0x)' : 'Capture Fuel Pump Display (1.0x)'"
       :filename-prefix="activeCameraTarget"
       @capture="onCameraCaptured"
       @close="activeCameraTarget = null"
